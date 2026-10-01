@@ -1,0 +1,34 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: seats
+      POSTGRES_PASSWORD: seats
+      POSTGRES_DB: seats
+    command: ["postgres", "-c", "max_connections=200"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U seats -d seats"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  api:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PORT: "8787"
+      DATABASE_URL: postgres://seats:seats@db:5432/seats?sslmode=disable
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-admin-dev-token}
+      TOKEN_SECRET: ${TOKEN_SECRET:-dev-token-secret-change-me}
+      DB_MAX_CONNS: "16"
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    ports:
+      - "8787:8787"
+    restart: unless-stopped
+
+volumes:
+  pgdata:

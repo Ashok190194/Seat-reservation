@@ -1,0 +1,39 @@
+# Fly.io config. First time:
+#   fly launch --no-deploy --copy-config
+#   fly postgres create --name seat-reservation-db --initial-cluster-size 1 --vm-size shared-cpu-1x --volume-size 1
+#   fly postgres attach seat-reservation-db          # sets DATABASE_URL
+#   fly secrets set ADMIN_TOKEN=$(openssl rand -hex 16) TOKEN_SECRET=$(openssl rand -hex 32)
+#   fly deploy
+app = "seat-reservation"
+primary_region = "sin"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8787"
+  DB_MAX_CONNS = "16"
+  LOG_LEVEL = "info"
+
+[http_service]
+  internal_port = 8787
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 2000
+    hard_limit = 4000
+
+  [[http_service.checks]]
+    grace_period = "15s"
+    interval = "10s"
+    method = "GET"
+    timeout = "3s"
+    path = "/readyz"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
