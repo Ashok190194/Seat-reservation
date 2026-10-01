@@ -32,6 +32,7 @@ type Metrics struct {
 	ReservationsCancelled prometheus.Counter
 	ReservationsExpired   prometheus.Counter
 	HoldsConfirmed        prometheus.Counter
+	IdempotencyKeysPurged prometheus.Counter
 	TxRetries             prometheus.Counter
 
 	HTTPRequests *prometheus.CounterVec
@@ -57,6 +58,8 @@ func New(pool *pgxpool.Pool, showLimit int, log *slog.Logger) *Metrics {
 			Name: "reservations_expired_total", Help: "Holds released by the expiry sweeper."}),
 		HoldsConfirmed: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "holds_confirmed_total", Help: "Holds converted to confirmed via POST /reservations/{id}/confirm."}),
+		IdempotencyKeysPurged: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "idempotency_keys_purged_total", Help: "Idempotency keys deleted after IDEMPOTENCY_TTL."}),
 		TxRetries: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "db_tx_retries_total", Help: "Transactions retried after a serialization failure or deadlock (expected to stay at zero)."}),
 		HTTPRequests: prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -76,7 +79,7 @@ func New(pool *pgxpool.Pool, showLimit int, log *slog.Logger) *Metrics {
 	}
 	reg.MustRegister(
 		m.ReservationsConfirmed, m.ReservationsHeld, m.ReservationsDeclined, m.ReservationsCancelled,
-		m.ReservationsExpired, m.HoldsConfirmed, m.TxRetries,
+		m.ReservationsExpired, m.HoldsConfirmed, m.IdempotencyKeysPurged, m.TxRetries,
 		m.HTTPRequests, m.HTTPDuration, m.HTTPInFlight, m.ReserveDuration,
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),

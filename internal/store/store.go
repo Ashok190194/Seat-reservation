@@ -529,6 +529,19 @@ func (s *Store) SweepExpired(ctx context.Context, batch int) (seats int, reserva
 	return seats, int(tag.RowsAffected()), tx.Commit(ctx)
 }
 
+// PurgeIdempotencyKeys deletes keys older than ttl in bounded batches. After
+// the TTL a retry with an old key is treated as a new request, which is the
+// documented contract (clients must retry within the window).
+func (s *Store) PurgeIdempotencyKeys(ctx context.Context, ttl time.Duration, batch int) (int, error) {
+	tag, err := s.pool.Exec(ctx, `DELETE FROM idempotency_keys WHERE (user_id, key) IN (
+		SELECT user_id, key FROM idempotency_keys WHERE created_at < now() - $1::interval
+		ORDER BY created_at LIMIT $2 FOR UPDATE SKIP LOCKED)`, ttl, batch)
+	if err != nil {
+		return 0, err
+	}
+	return int(tag.RowsAffected()), nil
+}
+
 // ---------------------------------------------------------------------------
 // helpers
 

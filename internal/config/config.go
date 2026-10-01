@@ -18,6 +18,9 @@ type Config struct {
 	DBMaxConns    int32
 	LogLevel      string
 	SweepInterval time.Duration
+	// IdempotencyTTL is how long a key replays its stored response. After it,
+	// the key is purged and a retry becomes a fresh request.
+	IdempotencyTTL time.Duration
 	// MetricsShowLimit caps how many shows the per-show seat gauges report, to
 	// keep /metrics cardinality bounded.
 	MetricsShowLimit int
@@ -54,6 +57,11 @@ func Load() (Config, error) {
 		return c, fmt.Errorf("SWEEP_INTERVAL must be a positive duration, e.g. 1s")
 	}
 	c.SweepInterval = d
+	ttl, err := time.ParseDuration(getenv("IDEMPOTENCY_TTL", "24h"))
+	if err != nil || ttl <= 0 {
+		return c, fmt.Errorf("IDEMPOTENCY_TTL must be a positive duration, e.g. 24h")
+	}
+	c.IdempotencyTTL = ttl
 	if v := os.Getenv("METRICS_SHOW_LIMIT"); v != "" {
 		if m, err := strconv.Atoi(v); err == nil && m > 0 {
 			c.MetricsShowLimit = m

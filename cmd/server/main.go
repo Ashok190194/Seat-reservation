@@ -66,7 +66,7 @@ func main() {
 		}
 		ready.Store(true)
 		log.Info("ready: database reachable and schema applied")
-		runSweeper(ctx, st, m, log, cfg.SweepInterval)
+		runSweeper(ctx, st, m, log, cfg.SweepInterval, cfg.IdempotencyTTL)
 	}()
 
 	httpServer := &http.Server{
@@ -78,7 +78,7 @@ func main() {
 		// for a DB connection and a timeout here would turn declines into errors.
 	}
 	go func() {
-		log.Info("listening", "port", cfg.Port, "db_max_conns", cfg.DBMaxConns, "sweep_interval", cfg.SweepInterval.String())
+		log.Info("listening", "port", cfg.Port, "db_max_conns", cfg.DBMaxConns, "sweep_interval", cfg.SweepInterval.String(), "idempotency_ttl", cfg.IdempotencyTTL.String())
 		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("http server", "err", err)
 			os.Exit(1)
@@ -116,14 +116,28 @@ func bootstrapDB(ctx context.Context, pool *pgxpool.Pool, log *slog.Logger) {
 
 // runSweeper releases expired holds. Many instances can run it concurrently;
 // SKIP LOCKED makes that safe and the work idempotent.
-func runSweeper(ctx context.Context, st *store.Store, m *metrics.Metrics, log *slog.Logger, every time.Duration) {
+func runSweeper(ctx context.Context, st *store.Store, m *metrics.Metrics, log *slog.Logger, every, idemTTL time.Duration) {
 	const batch = 1000
 	t := time.NewTicker(every)
 	defer t.Stop()
+	// Key purging is housekeeping, not latency-sensitive: once a minute is plenty.
+	purge := time.NewTicker(time.Minute)
+	defer purge.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-purge.C:
+			purgeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			n, err := st.PurgeIdempotencyKeys(purgeCtx, idemTTL, batch)
+			cancel()
+			if err != nil && ctx.Err() == nil {
+				log.Warn("idempotency key purge failed", "err", err)
+			} else if n > 0 {
+				m.IdempotencyKeysPurged.Add(float64(n))
+				log.Info("idempotency keys purged", "count", n, "older_than", idemTTL.String())
+			}
+			continue
 		case <-t.C:
 		}
 		for {

@@ -101,7 +101,7 @@ What the human directed and what they changed afterwards should be listed here b
 2. **Payment step.** Make `confirm` take a payment intent id and make it idempotent on that id; today `confirm` simulates payment success.
 3. **Queue the front door.** For true on-sale spikes, a waiting-room token (admit N users/second) in front of `/reserve` keeps DB lock queues short and p99 flat; correctness does not depend on it, latency does.
 4. **Read replicas for `GET /shows/{id}`** and the metric gauges, with staleness exposed as a metric.
-5. **Key TTL.** Idempotency rows live forever; add `created_at`-based expiry (24 h) via the sweeper.
+5. **Key TTL** — done: keys older than `IDEMPOTENCY_TTL` (24 h) are purged by the sweeper, batched with `SKIP LOCKED`.
 6. **Seat maps and pricing tiers.** Move `price_paise` from the show to the seat row and sum the locked rows in step 5; today `amount_paise = price_paise × seats`.
 7. **Audit log.** An append-only `seat_events` table written in the same transaction as each state change, for support and reconciliation against the payment ledger.
 8. **OpenTelemetry traces** with the request id as a span attribute, so a slow reserve can be attributed to lock wait vs. pool wait vs. network.

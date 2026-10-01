@@ -61,3 +61,6 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (user_id, key)
 );
+
+-- Lets the sweeper find expired keys without scanning the table.
+CREATE INDEX IF NOT EXISTS idempotency_keys_by_age ON idempotency_keys (created_at);

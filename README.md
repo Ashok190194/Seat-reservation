@@ -78,6 +78,7 @@ go run ./cmd/server                   # listens on :8787
 | `TOKEN_SECRET` | `dev-token-secret-change-me` ⚠ | HMAC key for user tokens |
 | `DB_MAX_CONNS` | `16` | Pool ceiling; requests queue for a connection rather than fail |
 | `SWEEP_INTERVAL` | `1s` | How often expired holds are released |
+| `IDEMPOTENCY_TTL` | `24h` | How long a key replays its stored response; older keys are purged once a minute |
 | `LOG_LEVEL` | `info` | `debug` also logs `/metrics` and health probes |
 
 The two ⚠ defaults are logged as warnings at boot; set real values in production (the Render blueprint generates them).
@@ -192,7 +193,7 @@ POST /shows/{id}/reserve    (user)        Idempotency-Key: <key>   (or "idempote
 
 **Partial requests are all-or-nothing.** `["A12","A13"]` with A13 taken reserves nothing and returns `409 seat_taken {"seats":["A13"]}`. Duplicate labels in one request are collapsed.
 
-**Idempotency** is scoped to `(user, key)`. The stored response (including declines) is replayed for retries; the key is bound to a hash of `(show_id, sorted seats)`. Keys are optional; without one, each request is independent.
+**Idempotency** is scoped to `(user, key)`. The stored response (including declines) is replayed for retries; the key is bound to a hash of `(show_id, sorted seats)`. Keys are optional; without one, each request is independent. Keys are retained for `IDEMPOTENCY_TTL` (default 24 h); after that a retry is treated as a new request.
 
 ### Reservations
 
