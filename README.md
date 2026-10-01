@@ -197,6 +197,7 @@ POST /shows/{id}/reserve    (user)        Idempotency-Key: <key>   (or "idempote
 ### Reservations
 
 ```
+GET  /users/me/reservations        (user)   → 200 { "user_id": "…", "reservations": [ … ] }   (newest first, ?show_id= to filter)
 GET  /reservations/{id}            (owner)  → 200 reservation
 POST /reservations/{id}/cancel     (owner)  → 200 reservation with status "cancelled"; seats return to available
 POST /reservations/{id}/confirm    (owner)  → 200 reservation with status "confirmed" (hold → sale)

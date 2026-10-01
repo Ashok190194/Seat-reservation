@@ -67,6 +67,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /shows", s.listShows)
 	mux.HandleFunc("GET /shows/{id}", s.getShow)
 	mux.HandleFunc("POST /shows/{id}/reserve", s.reserve)
+	mux.HandleFunc("GET /users/me/reservations", s.myReservations)
 	mux.HandleFunc("GET /reservations/{id}", s.getReservation)
 	mux.HandleFunc("POST /reservations/{id}/cancel", s.cancel)
 	mux.HandleFunc("POST /reservations/{id}/confirm", s.confirm)
@@ -362,6 +363,20 @@ func requestHash(showID string, sortedSeats []string) string {
 
 // ---------------------------------------------------------------------------
 // Reservations
+
+// myReservations lists the token holder's reservations. Filter with ?show_id=.
+func (s *Server) myReservations(w http.ResponseWriter, r *http.Request) {
+	user, ok := s.requireUser(w, r)
+	if !ok {
+		return
+	}
+	list, err := s.store.ListUserReservations(r.Context(), user, strings.TrimSpace(r.URL.Query().Get("show_id")), 100)
+	if err != nil {
+		s.serverError(w, r, "list reservations", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"user_id": user, "reservations": list})
+}
 
 func (s *Server) getReservation(w http.ResponseWriter, r *http.Request) {
 	user, ok := s.requireUser(w, r)

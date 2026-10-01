@@ -359,6 +359,32 @@ func (s *Store) GetReservation(ctx context.Context, id, userID string) (*Reserva
 	return res, nil
 }
 
+// ListUserReservations returns the caller's reservations, newest first,
+// optionally restricted to one show.
+func (s *Store) ListUserReservations(ctx context.Context, userID, showID string, limit int) ([]Reservation, error) {
+	if showID != "" {
+		if _, err := uuid.Parse(showID); err != nil {
+			return []Reservation{}, nil
+		}
+	}
+	rows, err := s.pool.Query(ctx, `SELECT id, show_id, user_id, seats, amount_paise, status, expires_at, created_at, updated_at
+		FROM reservations WHERE user_id = $1 AND ($2 = '' OR show_id = $2::uuid)
+		ORDER BY created_at DESC LIMIT $3`, userID, showID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Reservation{}
+	for rows.Next() {
+		var r Reservation
+		if err := rows.Scan(&r.ID, &r.ShowID, &r.UserID, &r.Seats, &r.AmountPaise, &r.Status, &r.ExpiresAt, &r.CreatedAt, &r.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // Cancel releases a reservation's seats. Only the owner may cancel. The seat
 // release is guarded by reservation_id, so a stale cancel can never free a
 // seat that has since been sold to someone else.
