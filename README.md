@@ -142,6 +142,8 @@ Tests (`make test`, needs `DATABASE_URL`) cover the same invariants in-process w
 
 ## API
 
+Machine-readable spec: [`openapi.yaml`](openapi.yaml) (OpenAPI 3.1; paste into https://editor.swagger.io to browse).
+
 All bodies are JSON. Errors look like `{"error":{"code":"seat_taken","message":"…","seats":["A12"]}}`. Every response carries `X-Request-ID` (echoed if you send one) which also appears in the logs.
 
 ### Auth

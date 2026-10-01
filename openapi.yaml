@@ -1,0 +1,265 @@
+openapi: 3.1.0
+info:
+  title: Seat Reservation API
+  version: 1.0.0
+  description: |
+    Sells assigned seats for a show. All money is integer paise. Identity comes
+    only from the bearer token; a `user_id` in a request body is ignored.
+    Declines are 4xx domain outcomes with `{"error":{"code":...}}`; the service
+    does not return 5xx for contention. Every response carries `X-Request-ID`.
+servers:
+  - url: https://seat-reservation-8wdh.onrender.com
+  - url: http://localhost:8787
+
+components:
+  securitySchemes:
+    userToken:
+      type: http
+      scheme: bearer
+      description: Token from POST /auth/token (HMAC-signed user id).
+    adminToken:
+      type: http
+      scheme: bearer
+      description: The ADMIN_TOKEN environment value.
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema: { type: string, maxLength: 128 }
+      description: Optional. Same key + same body replays the original response; same key + different body is 409.
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum: [seat_taken, per_user_limit, idempotency_key_reused, unknown_seat, show_not_found,
+                     reservation_not_found, reservation_expired, reservation_cancelled, hold_expired,
+                     invalid_request, unauthorized, forbidden, not_found, unavailable, internal_error]
+            message: { type: string }
+            seats:
+              type: array
+              items: { type: string }
+              description: Offending seat labels for seat_taken / unknown_seat.
+    SeatStatus:
+      type: string
+      enum: [available, held, confirmed]
+    Show:
+      type: object
+      required: [id, name, price_paise, per_user_limit, hold_ttl_seconds, total_seats, counts, seats]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        price_paise: { type: integer, format: int64 }
+        per_user_limit: { type: integer }
+        hold_ttl_seconds: { type: integer, description: "0 = reserve confirms immediately" }
+        total_seats: { type: integer }
+        created_at: { type: string, format: date-time }
+        counts:
+          type: object
+          description: available + held + confirmed == total_seats, always.
+          properties:
+            available: { type: integer }
+            held: { type: integer }
+            confirmed: { type: integer }
+        seats:
+          type: array
+          items:
+            type: object
+            properties:
+              label: { type: string }
+              status: { $ref: '#/components/schemas/SeatStatus' }
+    Reservation:
+      type: object
+      required: [reservation_id, show_id, user_id, seats, amount_paise, status]
+      properties:
+        reservation_id: { type: string, format: uuid }
+        show_id: { type: string, format: uuid }
+        user_id: { type: string }
+        seats: { type: array, items: { type: string } }
+        amount_paise: { type: integer, format: int64 }
+        status: { type: string, enum: [held, confirmed, cancelled, expired] }
+        expires_at: { type: [string, 'null'], format: date-time }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+  responses:
+    Unauthorized:
+      description: Missing or invalid bearer token.
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Forbidden:
+      description: The reservation belongs to another user.
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    NotFound:
+      description: Not found.
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+paths:
+  /healthz:
+    get:
+      summary: Liveness
+      responses:
+        '200': { description: Process is up. }
+  /readyz:
+    get:
+      summary: Readiness (fails closed)
+      description: 200 only when the schema is applied and the database answers SELECT 1 within 2s.
+      responses:
+        '200': { description: Ready. }
+        '503': { description: Database unreachable or schema not yet applied. }
+  /metrics:
+    get:
+      summary: Prometheus metrics
+      responses:
+        '200': { description: Prometheus text exposition format., content: { text/plain: {} } }
+
+  /auth/token:
+    post:
+      summary: Issue a user token (identity-provider stand-in)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user_id]
+              properties:
+                user_id: { type: string, pattern: '^[A-Za-z0-9._@-]{1,64}$' }
+      responses:
+        '201':
+          description: Token issued.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user_id: { type: string }
+                  token: { type: string }
+                  token_type: { type: string, const: Bearer }
+        '400': { description: Invalid user_id., content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+
+  /shows:
+    get:
+      summary: List the 20 most recent shows with counts
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  shows: { type: array, items: { $ref: '#/components/schemas/Show' } }
+    post:
+      summary: Create a show (admin)
+      security: [ { adminToken: [] } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, seats, price_paise]
+              properties:
+                name: { type: string, maxLength: 200 }
+                seats: { type: array, minItems: 1, maxItems: 20000, items: { type: string, maxLength: 32 }, description: Unique labels. }
+                price_paise: { type: integer, format: int64, minimum: 0 }
+                per_user_limit: { type: integer, minimum: 1, maximum: 100, default: 4 }
+                hold_ttl_seconds: { type: integer, minimum: 0, maximum: 86400, default: 0 }
+      responses:
+        '201': { description: Created., content: { application/json: { schema: { $ref: '#/components/schemas/Show' } } } }
+        '400': { description: Validation error., content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /shows/{id}:
+    get:
+      summary: Show state with per-seat status and counts
+      parameters: [ { name: id, in: path, required: true, schema: { type: string, format: uuid } } ]
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Show' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /shows/{id}/reserve:
+    post:
+      summary: Reserve seats (all-or-nothing)
+      description: |
+        Exactly one 201 per seat under any concurrency; losers get 409 seat_taken.
+        If the show has hold_ttl_seconds > 0 the reservation is `held` and must be confirmed before `expires_at`;
+        otherwise it is `confirmed` immediately. A replayed response carries `Idempotent-Replayed: true`.
+      security: [ { userToken: [] } ]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [seats]
+              properties:
+                seats: { type: array, minItems: 1, items: { type: string } }
+                idempotency_key: { type: string, maxLength: 128, description: Alternative to the header. }
+      responses:
+        '201': { description: Reserved (or replayed)., content: { application/json: { schema: { $ref: '#/components/schemas/Reservation' } } } }
+        '400': { description: invalid_request, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { description: show_not_found, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '409': { description: seat_taken | per_user_limit | idempotency_key_reused, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '422': { description: unknown_seat, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+
+  /users/me/reservations:
+    get:
+      summary: List the caller's reservations (newest first)
+      security: [ { userToken: [] } ]
+      parameters: [ { name: show_id, in: query, required: false, schema: { type: string, format: uuid } } ]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user_id: { type: string }
+                  reservations: { type: array, items: { $ref: '#/components/schemas/Reservation' } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /reservations/{id}:
+    get:
+      summary: Get a reservation (owner only)
+      security: [ { userToken: [] } ]
+      parameters: [ { name: id, in: path, required: true, schema: { type: string, format: uuid } } ]
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Reservation' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /reservations/{id}/cancel:
+    post:
+      summary: Cancel a reservation and release its seats (owner only, idempotent)
+      security: [ { userToken: [] } ]
+      parameters: [ { name: id, in: path, required: true, schema: { type: string, format: uuid } } ]
+      responses:
+        '200': { description: Cancelled (or already cancelled)., content: { application/json: { schema: { $ref: '#/components/schemas/Reservation' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: reservation_expired, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+
+  /reservations/{id}/confirm:
+    post:
+      summary: Convert a live hold into a confirmed sale (owner only, idempotent)
+      security: [ { userToken: [] } ]
+      parameters: [ { name: id, in: path, required: true, schema: { type: string, format: uuid } } ]
+      responses:
+        '200': { description: Confirmed (or already confirmed)., content: { application/json: { schema: { $ref: '#/components/schemas/Reservation' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: hold_expired | reservation_cancelled | reservation_expired, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
