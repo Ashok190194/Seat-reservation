@@ -193,7 +193,7 @@ func (s *Store) reserveOnce(ctx context.Context, in ReserveInput) (*ReserveOutco
 			// would still be blocked on the index). Replay their outcome.
 			var hash string
 			var code int
-			var body []byte
+			var body string
 			err := tx.QueryRow(ctx, `SELECT request_hash, response_code, response_body FROM idempotency_keys
 				WHERE user_id = $1 AND key = $2`, in.UserID, in.IdempotencyKey).Scan(&hash, &code, &body)
 			if err != nil {
@@ -208,7 +208,7 @@ func (s *Store) reserveOnce(ctx context.Context, in ReserveInput) (*ReserveOutco
 				return &ReserveOutcome{Decline: &Decline{HTTPStatus: 409, Code: "idempotency_in_progress",
 					Message: "a request with this idempotency key is still being processed"}}, nil
 			}
-			return &ReserveOutcome{Replayed: true, ReplayStatus: code, ReplayBody: body}, nil
+			return &ReserveOutcome{Replayed: true, ReplayStatus: code, ReplayBody: []byte(body)}, nil
 		}
 	}
 
@@ -221,7 +221,7 @@ func (s *Store) reserveOnce(ctx context.Context, in ReserveInput) (*ReserveOutco
 				resID = &out.Reservation.ID
 			}
 			if _, err := tx.Exec(ctx, `UPDATE idempotency_keys SET response_code = $3, response_body = $4, reservation_id = $5
-				WHERE user_id = $1 AND key = $2`, in.UserID, in.IdempotencyKey, code, body, resID); err != nil {
+				WHERE user_id = $1 AND key = $2`, in.UserID, in.IdempotencyKey, code, string(body), resID); err != nil {
 				return nil, err
 			}
 		}

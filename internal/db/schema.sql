@@ -55,7 +55,8 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
     key            TEXT        NOT NULL,
     request_hash   TEXT        NOT NULL,
     response_code  INT         NOT NULL,
-    response_body  JSONB       NOT NULL,
+    -- TEXT, not JSONB: a replay must be byte-identical to the original response.
+    response_body  TEXT        NOT NULL,
     reservation_id UUID        NULL,
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (user_id, key)
