@@ -273,5 +273,7 @@ internal/store    every transaction: reserve, cancel, confirm, sweep (the correc
 internal/db       pool + embedded idempotent schema
 internal/auth     HMAC bearer tokens, admin token
 internal/metrics  Prometheus registry; seat gauges are a live DB collector
+openapi.yaml      OpenAPI 3.1 description of the API
+.github/workflows CI: gofmt, vet, race tests against Postgres, smoke burst, Docker build
 Dockerfile, docker-compose.yml, render.yaml, fly.toml, Makefile, burst.sh
 ```
