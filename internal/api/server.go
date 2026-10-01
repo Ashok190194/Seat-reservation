@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -44,10 +45,13 @@ type Server struct {
 	metrics *metrics.Metrics
 	pool    *pgxpool.Pool
 	log     *slog.Logger
+	// ready flips to true once the schema has been applied; until then
+	// /readyz reports 503 even if the database answers pings.
+	ready *atomic.Bool
 }
 
-func New(st *store.Store, a *auth.Authenticator, m *metrics.Metrics, pool *pgxpool.Pool, log *slog.Logger) *Server {
-	return &Server{store: st, auth: a, metrics: m, pool: pool, log: log}
+func New(st *store.Store, a *auth.Authenticator, m *metrics.Metrics, pool *pgxpool.Pool, log *slog.Logger, ready *atomic.Bool) *Server {
+	return &Server{store: st, auth: a, metrics: m, pool: pool, log: log, ready: ready}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -82,6 +86,12 @@ func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
 // readyz fails closed: if the database cannot answer SELECT 1 within 2s we
 // report 503 so the platform stops routing traffic to this instance.
 func (s *Server) readyz(w http.ResponseWriter, r *http.Request) {
+	if !s.ready.Load() {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"status": "starting", "checks": map[string]any{"database": map[string]any{"ok": false, "error": "schema not yet applied"}},
+		})
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 	defer cancel()
 	start := time.Now()

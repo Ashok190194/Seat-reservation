@@ -9,8 +9,11 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/seatreserve/seatreserve/internal/api"
 	"github.com/seatreserve/seatreserve/internal/auth"
@@ -39,30 +42,32 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// pgxpool does not dial eagerly, so this only fails on a malformed URL.
 	pool, err := db.Connect(ctx, cfg.DatabaseURL, cfg.DBMaxConns)
 	if err != nil {
-		log.Error("database connect", "err", err)
+		log.Error("database config", "err", err)
 		os.Exit(1)
 	}
 	defer pool.Close()
 
-	// Wait for the database on cold start (managed Postgres often comes up a
-	// few seconds after the web process). Readiness stays 503 until this passes.
-	if err := waitForDB(ctx, pool, log, 60*time.Second); err != nil {
-		log.Error("database never became reachable", "err", err)
-		os.Exit(1)
-	}
-	if err := db.Migrate(ctx, pool); err != nil {
-		log.Error("migrate", "err", err)
-		os.Exit(1)
-	}
-
 	m := metrics.New(pool, cfg.MetricsShowLimit, log)
 	st := store.New(pool, log, m.TxRetries.Inc)
 	a := auth.New(cfg.TokenSecret, cfg.AdminToken)
-	srv := api.New(st, a, m, pool, log)
+	var ready atomic.Bool
+	srv := api.New(st, a, m, pool, log, &ready)
 
-	go runSweeper(ctx, st, m, log, cfg.SweepInterval)
+	// Liveness is served immediately; readiness stays 503 until the database is
+	// reachable and the schema is applied. Managed Postgres often comes up a few
+	// seconds after the web process on a cold start, so keep retrying.
+	go func() {
+		bootstrapDB(ctx, pool, log)
+		if ctx.Err() != nil {
+			return
+		}
+		ready.Store(true)
+		log.Info("ready: database reachable and schema applied")
+		runSweeper(ctx, st, m, log, cfg.SweepInterval)
+	}()
 
 	httpServer := &http.Server{
 		Addr:              net.JoinHostPort("", cfg.Port),
@@ -89,22 +94,23 @@ func main() {
 	}
 }
 
-func waitForDB(ctx context.Context, pool interface {
-	Ping(context.Context) error
-}, log *slog.Logger, max time.Duration) error {
-	deadline := time.Now().Add(max)
-	for attempt := 1; ; attempt++ {
-		pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		err := pool.Ping(pingCtx)
+// bootstrapDB pings and migrates until it succeeds or the process is told to stop.
+func bootstrapDB(ctx context.Context, pool *pgxpool.Pool, log *slog.Logger) {
+	for attempt := 1; ctx.Err() == nil; attempt++ {
+		stepCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		err := pool.Ping(stepCtx)
+		if err == nil {
+			err = db.Migrate(stepCtx, pool)
+		}
 		cancel()
 		if err == nil {
-			return nil
-		}
-		if time.Now().After(deadline) || ctx.Err() != nil {
-			return err
+			return
 		}
 		log.Warn("database not ready, retrying", "attempt", attempt, "err", err)
-		time.Sleep(time.Duration(min(attempt, 5)) * time.Second)
+		select {
+		case <-ctx.Done():
+		case <-time.After(time.Duration(min(attempt, 5)) * time.Second):
+		}
 	}
 }
 
