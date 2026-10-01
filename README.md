@@ -1,0 +1,253 @@
+# Seat Reservation at Scale
+
+A small JSON API that sells assigned seats for a show and stays correct when
+thousands of buyers stampede the same seats at on-sale time:
+
+- **No double-sell** — a race for one seat produces exactly one `201`; everyone else gets a clean `409 seat_taken`.
+- **Per-user limit** — at most `per_user_limit` seats per user per show (default 4), even across parallel requests.
+- **Exactly-once idempotency** — same key replays the original response byte-for-byte; same key with a different body is `409 idempotency_key_reused`.
+- **Zero 5xx under load** — declines are 4xx domain outcomes.
+- **Reconciliation invariant** — `available + held + confirmed == total_seats`, always.
+- **Observable** — Prometheus metrics that reconcile with the API, structured JSON logs with request ids, liveness/readiness, and a live dashboard at `/`.
+
+Stack: Go 1.25, PostgreSQL 16, `pgx`, `prometheus/client_golang`. Single binary, ~21 MB distroless image. Money is integer paise everywhere.
+
+See [WRITEUP.md](WRITEUP.md) for the design: the atomic decision, lock ordering, idempotency, holds, CAP stance, observability, and AI usage.
+
+---
+
+## Live deployment
+
+| | |
+|---|---|
+| **Live URL** | _fill in after deploying — see [Deploy](#deploy) below_ |
+| Liveness | `GET /healthz` |
+| Readiness (checks DB, fails closed) | `GET /readyz` |
+| Metrics | `GET /metrics` |
+| Dashboard | `GET /` |
+
+> The repo ships one-click configs for Render (`render.yaml`), Fly.io (`fly.toml`) and a `Dockerfile` that works on Railway. Deploying needs an account on one of those platforms; the exact steps are in [Deploy](#deploy).
+
+---
+
+## Run locally
+
+### With Docker Compose (recommended — identical to the deployed image)
+
+```bash
+docker compose up --build -d          # Postgres 16 + API on :8787
+curl -s localhost:8787/readyz         # {"status":"ready", ...}
+```
+
+`make docker-up` does the same and waits for readiness. `make docker-down` tears it down including the volume.
+
+### With Go directly
+
+You need Go 1.25+ (the `go` directive in `go.mod` auto-downloads the toolchain if you have any Go ≥ 1.21) and a Postgres:
+
+```bash
+export DATABASE_URL='postgres://seats:seats@127.0.0.1:5432/seats?sslmode=disable'
+go run ./cmd/server                   # listens on :8787
+```
+
+### Configuration
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `DATABASE_URL` | _(required)_ | Postgres connection string |
+| `PORT` | `8787` | Listen port (Render/Railway inject their own) |
+| `ADMIN_TOKEN` | `admin-dev-token` ⚠ | Bearer token for `POST /shows` |
+| `TOKEN_SECRET` | `dev-token-secret-change-me` ⚠ | HMAC key for user tokens |
+| `DB_MAX_CONNS` | `16` | Pool ceiling; requests queue for a connection rather than fail |
+| `SWEEP_INTERVAL` | `1s` | How often expired holds are released |
+| `LOG_LEVEL` | `info` | `debug` also logs `/metrics` and health probes |
+
+The two ⚠ defaults are logged as warnings at boot; set real values in production (the Render blueprint generates them).
+
+---
+
+## One-command burst
+
+Reproduces the on-sale stampede — hot-seat storm, per-user-limit race, 20 000 mixed requests with idempotent retries mixed in, same-key/different-body, cross-user cancel — then prints the outcome distribution and the final reconciliation, and exits non-zero if any invariant fails.
+
+```bash
+./burst.sh http://localhost:8787
+# or
+make burst BASE_URL=https://your-live-url ADMIN_TOKEN=<your admin token>
+# or, without a Go toolchain, from the image:
+docker run --rm --network=host --entrypoint /burst <image> -url https://your-live-url -admin-token <token>
+```
+
+Tuning flags (`go run ./cmd/burst -h`): `-seats 1000 -users 2000 -requests 20000 -concurrency 500 -hot-seats 5 -hot-users 500 -limit 4 -ttl 0 -retry-pct 5`.
+`make burst-small` is a lighter preset for free-tier instances. Use `-ttl 120` to exercise hold mode.
+
+Sample output against a local instance (4 vCPU laptop-class VM, pool of 16):
+
+```
+  hot-seat storm                       2500 requests in 826ms (3027 req/s)
+    201 created                           5
+    4xx seat_taken                     2495
+    5xx                                   0
+    seat A1     winners: 1   ... seat A5     winners: 1
+
+  per-user limit (10 parallel, limit 4)     10 requests
+    201 created                           4
+    4xx per_user_limit                    6
+
+  general stampede                    20000 requests in 3.252s (6150 req/s)
+    201 created                        1030
+    4xx per_user_limit                    4
+    4xx seat_taken                    18966
+    idempotent replays (orig status)    961
+    5xx                                   0
+    replays with identical response: 961 / 961
+
+  same key, different seats              50 requests
+    4xx idempotency_key_reused           50
+
+  cross-user cancel of 4ca0c00a-… → 403 forbidden
+
+  reconciliation (GET /shows/ab031a5b-…)
+    available 0 + held 0 + confirmed 1000 = 1000 ; total_seats 1000  ✓
+    seats won by this run (distinct): 1000 ; seats taken per API: 1000  ✓
+    /metrics seats_by_status: available 0 held 0 confirmed 1000  ✓
+
+  ✓ all checks passed
+```
+
+Tests (`make test`, needs `DATABASE_URL`) cover the same invariants in-process with the race detector: 200-way single-seat race, opposite-order multi-seat requests, per-user limit under concurrency, 50 concurrent same-key requests, decline replay, hold expiry / no-resurrection, and sweeper-vs-reserve deadlock freedom.
+
+---
+
+## API
+
+All bodies are JSON. Errors look like `{"error":{"code":"seat_taken","message":"…","seats":["A12"]}}`. Every response carries `X-Request-ID` (echoed if you send one) which also appears in the logs.
+
+### Auth
+
+Identity comes **only** from the bearer token; a `user_id` in a request body is ignored.
+
+```
+POST /auth/token            {"user_id":"alice"}  →  201 {"token":"…","user_id":"alice","token_type":"Bearer"}
+```
+
+This endpoint stands in for an identity provider. Tokens are `base64url(user_id).base64url(HMAC-SHA256(TOKEN_SECRET, user_id))`.
+Admin calls use `Authorization: Bearer <ADMIN_TOKEN>`.
+
+### Shows
+
+```
+POST /shows                 (admin)
+{ "name": "friday-night", "seats": ["A1","A2","A3"], "price_paise": 25000,
+  "per_user_limit": 4,            // optional, default 4
+  "hold_ttl_seconds": 0 }         // optional, default 0 = reserve confirms immediately
+→ 201 { "id": "…", "name": "…", "price_paise": 25000, "per_user_limit": 4, "hold_ttl_seconds": 0,
+        "total_seats": 3, "counts": {"available":3,"held":0,"confirmed":0},
+        "seats": [{"label":"A1","status":"available"}, …] }
+
+GET  /shows                 → 200 { "shows": [ {…show with counts…} ] }   (20 most recent)
+GET  /shows/{id}            → 200 same shape as create; counts always sum to total_seats
+```
+
+### Reserve
+
+```
+POST /shows/{id}/reserve    (user)        Idempotency-Key: <key>   (or "idempotency_key" in the body)
+{ "seats": ["A12","A13"] }
+→ 201 { "reservation_id":"…", "show_id":"…", "user_id":"alice", "seats":["A12","A13"],
+        "amount_paise": 50000, "status":"confirmed", "expires_at": null, … }
+```
+
+| Status | `error.code` | When |
+|---|---|---|
+| 201 | | reserved (`status` is `confirmed`, or `held` if the show has `hold_ttl_seconds > 0`) |
+| 201/4xx + `Idempotent-Replayed: true` | | same key, same body — the original response replayed verbatim |
+| 409 | `seat_taken` | any requested seat is held/confirmed (`seats` lists the offenders) |
+| 409 | `per_user_limit` | would exceed the show's limit |
+| 409 | `idempotency_key_reused` | same key, different seats/show |
+| 422 | `unknown_seat` | a label that isn't in this show |
+| 404 | `show_not_found` | |
+| 401 | `unauthorized` | missing/invalid token |
+| 400 | `invalid_request` | malformed body, header/body key mismatch, >100 seats, etc. |
+
+**Partial requests are all-or-nothing.** `["A12","A13"]` with A13 taken reserves nothing and returns `409 seat_taken {"seats":["A13"]}`. Duplicate labels in one request are collapsed.
+
+**Idempotency** is scoped to `(user, key)`. The stored response (including declines) is replayed for retries; the key is bound to a hash of `(show_id, sorted seats)`. Keys are optional; without one, each request is independent.
+
+### Reservations
+
+```
+GET  /reservations/{id}            (owner)  → 200 reservation
+POST /reservations/{id}/cancel     (owner)  → 200 reservation with status "cancelled"; seats return to available
+POST /reservations/{id}/confirm    (owner)  → 200 reservation with status "confirmed" (hold → sale)
+```
+
+Non-owners get `403 forbidden`. Cancelling an already-cancelled reservation is a no-op `200`; cancelling or confirming an expired hold is `409 reservation_expired` / `409 hold_expired`. A cancel can never free a seat that has since been sold to someone else (the release is keyed on the reservation id).
+
+### Holds
+
+Both release models are supported. With `hold_ttl_seconds: 0` (default) a reserve is an immediate sale and only explicit cancel frees seats. With `hold_ttl_seconds > 0`, reserve creates a `held` reservation with `expires_at`; the owner must `POST …/confirm` before then, otherwise a sweeper (every `SWEEP_INTERVAL`) returns the seats to `available` and marks the reservation `expired`.
+
+### Health & metrics
+
+- `GET /healthz` — liveness, always `200` while the process is up.
+- `GET /readyz` — `200` only when the schema is applied **and** `SELECT 1` succeeds within 2 s; otherwise `503` (fails closed).
+- `GET /metrics` — Prometheus text format. Key series:
+
+| Metric | Type | Notes |
+|---|---|---|
+| `reservations_confirmed_total` | counter | immediate sales + confirmed holds |
+| `reservations_held_total` | counter | holds created |
+| `reservations_declined_total{reason}` | counter | `seat_taken`, `per_user_limit`, `idempotent_replay`, `idempotency_key_reused`, `unknown_seat`, `show_not_found`, `invalid_request` |
+| `reservations_cancelled_total`, `reservations_expired_total`, `holds_confirmed_total` | counter | |
+| `seats_available{show_id,show_name}` | gauge | **read live from the DB on every scrape**, so it always matches `GET /shows/{id}` |
+| `seats_by_status{show_id,show_name,status}`, `seats_total{…}` | gauge | same |
+| `http_requests_total{method,route,status}`, `http_request_duration_seconds` | | per route pattern |
+| `reserve_transaction_duration_seconds` | histogram | includes lock waits |
+| `db_tx_retries_total` | counter | deadlock/serialization retries — expected to stay 0 |
+| `db_pool_*` | gauges | pool saturation |
+
+Logs are JSON lines on stdout. Every request logs one line with `request_id`, `route`, `status`, `duration_ms`, `user_id` and a domain `outcome` (e.g. `seat_taken`, `reserved_confirmed`, `idempotent_replay`). Reservation lifecycle events log separately with `reservation_id`.
+
+---
+
+## Deploy
+
+### Render (free tier, one click)
+
+1. Push this repo to GitHub/GitLab.
+2. Render dashboard → **New → Blueprint** → select the repo. `render.yaml` provisions a free Postgres and the web service, generates `ADMIN_TOKEN`/`TOKEN_SECRET`, and wires `DATABASE_URL`.
+3. Health check is `/readyz`; the service is live once it passes. Grab `ADMIN_TOKEN` from the service's Environment tab for the burst script.
+4. Logs: service → **Logs** (JSON lines, filter by `request_id`). Metrics: `https://<service>.onrender.com/metrics`.
+
+Free instances sleep after 15 min idle; the first request does a cold start (~10–20 s) and the process serves `/healthz` immediately while `/readyz` waits for the DB.
+
+### Fly.io
+
+```bash
+fly launch --no-deploy --copy-config
+fly postgres create --name seat-reservation-db --initial-cluster-size 1 --vm-size shared-cpu-1x --volume-size 1
+fly postgres attach seat-reservation-db
+fly secrets set ADMIN_TOKEN=$(openssl rand -hex 16) TOKEN_SECRET=$(openssl rand -hex 32)
+fly deploy
+fly logs
+```
+
+### Railway
+
+New project → Deploy from repo (uses the `Dockerfile`) → add a **PostgreSQL** plugin → set `DATABASE_URL=${{Postgres.DATABASE_URL}}`, `ADMIN_TOKEN`, `TOKEN_SECRET`. Set the health check path to `/readyz`.
+
+---
+
+## Repository layout
+
+```
+cmd/server        entrypoint: config, DB bootstrap, HTTP server, expiry sweeper
+cmd/burst         the stampede/verification tool
+internal/api      routing, auth middleware, validation, responses, access log, dashboard
+internal/store    every transaction: reserve, cancel, confirm, sweep (the correctness core)
+internal/db       pool + embedded idempotent schema
+internal/auth     HMAC bearer tokens, admin token
+internal/metrics  Prometheus registry; seat gauges are a live DB collector
+Dockerfile, docker-compose.yml, render.yaml, fly.toml, Makefile, burst.sh
+```
