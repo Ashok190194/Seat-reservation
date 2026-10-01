@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Seat Reservation — live state</title>
+<style>
+  :root { --bg:#0b0f17; --panel:#121826; --line:#1f2a3d; --text:#e6edf3; --muted:#8b98ab;
+          --avail:#1f6feb; --held:#d29922; --conf:#2ea043; --bad:#f85149; }
+  * { box-sizing:border-box }
+  body { margin:0; font:14px/1.45 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--text) }
+  header { display:flex; flex-wrap:wrap; gap:12px; align-items:center; padding:16px 20px; border-bottom:1px solid var(--line) }
+  header h1 { font-size:16px; margin:0 12px 0 0; font-weight:600 }
+  header .sub { color:var(--muted); font-size:12px }
+  select, input, button { background:var(--panel); color:var(--text); border:1px solid var(--line); border-radius:6px; padding:6px 10px; font:inherit }
+  button { cursor:pointer } button:hover { border-color:#3b4a66 }
+  main { padding:20px; display:grid; gap:16px; grid-template-columns: 1fr; max-width:1400px; margin:0 auto }
+  @media (min-width: 980px) { main { grid-template-columns: 2fr 1fr } }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px }
+  .panel h2 { margin:0 0 12px; font-size:13px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); font-weight:600 }
+  .stats { display:grid; grid-template-columns: repeat(auto-fit,minmax(120px,1fr)); gap:10px }
+  .stat { background:#0f1521; border:1px solid var(--line); border-radius:8px; padding:10px 12px }
+  .stat .k { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.05em }
+  .stat .v { font-size:22px; font-weight:600; font-variant-numeric: tabular-nums }
+  .stat.avail .v { color:#79b8ff } .stat.held .v { color:#e3b341 } .stat.conf .v { color:#56d364 }
+  .invariant { margin-top:12px; padding:10px 12px; border-radius:8px; font-weight:600; font-variant-numeric: tabular-nums }
+  .invariant.ok { background:rgba(46,160,67,.15); color:#56d364; border:1px solid rgba(46,160,67,.4) }
+  .invariant.bad { background:rgba(248,81,73,.15); color:var(--bad); border:1px solid rgba(248,81,73,.4) }
+  .grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(34px, 1fr)); gap:4px; margin-top:12px; max-height:60vh; overflow:auto }
+  .seat { aspect-ratio:1; border-radius:4px; display:flex; align-items:center; justify-content:center; font-size:9px; color:#fff; opacity:.95; font-variant-numeric: tabular-nums; overflow:hidden; white-space:nowrap }
+  .seat.available { background:var(--avail) } .seat.held { background:var(--held); color:#111 } .seat.confirmed { background:var(--conf) }
+  table { width:100%; border-collapse:collapse; font-variant-numeric: tabular-nums }
+  td { padding:6px 4px; border-bottom:1px solid var(--line) } td:last-child { text-align:right; font-weight:600 }
+  .muted { color:var(--muted) } .err { color:var(--bad) }
+  .legend span { display:inline-flex; align-items:center; gap:6px; margin-right:12px; color:var(--muted); font-size:12px }
+  .legend i { width:12px; height:12px; border-radius:3px; display:inline-block }
+  code { background:#0f1521; padding:2px 5px; border-radius:4px; font-size:12px }
+</style>
+</head>
+<body>
+<header>
+  <h1>Seat Reservation — live state</h1>
+  <select id="showSelect"><option value="">Loading shows…</option></select>
+  <input id="showInput" placeholder="or paste a show id" size="38">
+  <button id="go">Watch</button>
+  <span class="sub" id="status">—</span>
+</header>
+<main>
+  <section class="panel">
+    <h2>Show <span id="showName" class="muted"></span></h2>
+    <div class="stats">
+      <div class="stat"><div class="k">Total seats</div><div class="v" id="total">–</div></div>
+      <div class="stat avail"><div class="k">Available</div><div class="v" id="avail">–</div></div>
+      <div class="stat held"><div class="k">Held</div><div class="v" id="held">–</div></div>
+      <div class="stat conf"><div class="k">Confirmed</div><div class="v" id="conf">–</div></div>
+    </div>
+    <div id="invariant" class="invariant ok">available + held + confirmed == total_seats</div>
+    <div class="legend" style="margin-top:12px">
+      <span><i style="background:var(--avail)"></i>available</span>
+      <span><i style="background:var(--held)"></i>held</span>
+      <span><i style="background:var(--conf)"></i>confirmed</span>
+    </div>
+    <div class="grid" id="grid"></div>
+  </section>
+  <aside class="panel">
+    <h2>Prometheus counters (<code>/metrics</code>)</h2>
+    <table id="metrics"><tr><td class="muted">waiting for first scrape…</td><td></td></tr></table>
+    <p class="muted" style="margin-top:14px;font-size:12px">
+      Polling <code>GET /shows/{id}</code> and <code>GET /metrics</code> every second.
+      Counters are process-wide; seat gauges are read live from the database on every scrape.
+    </p>
+  </aside>
+</main>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  let showId = new URLSearchParams(location.search).get('show') || '';
+  const fmt = n => n.toLocaleString();
+
+  async function loadShows() {
+    try {
+      const r = await fetch('/shows'); const j = await r.json();
+      const sel = $('showSelect'); sel.innerHTML = '';
+      if (!j.shows.length) { sel.innerHTML = '<option value="">No shows yet — POST /shows to create one</option>'; return; }
+      for (const s of j.shows) {
+        const o = document.createElement('option');
+        o.value = s.id; o.textContent = `${s.name} · ${s.total_seats} seats · ${s.counts.available} free`;
+        sel.appendChild(o);
+      }
+      if (!showId) { showId = j.shows[0].id; history.replaceState(null, '', '?show=' + showId); }
+      sel.value = showId;
+    } catch (e) { $('status').textContent = 'could not list shows'; }
+  }
+
+  function render(st) {
+    $('showName').textContent = `${st.name} · ₹${(st.price_paise/100).toFixed(2)} per seat · limit ${st.per_user_limit}/user` + (st.hold_ttl_seconds ? ` · holds expire after ${st.hold_ttl_seconds}s` : ' · immediate confirm');
+    const c = st.counts, sum = c.available + c.held + c.confirmed;
+    $('total').textContent = fmt(st.total_seats); $('avail').textContent = fmt(c.available);
+    $('held').textContent = fmt(c.held); $('conf').textContent = fmt(c.confirmed);
+    const inv = $('invariant'); const ok = sum === st.total_seats;
+    inv.className = 'invariant ' + (ok ? 'ok' : 'bad');
+    inv.textContent = `${c.available} + ${c.held} + ${c.confirmed} = ${sum} ${ok ? '==' : '!='} ${st.total_seats} total_seats ${ok ? '✓' : '✗ INVARIANT VIOLATED'}`;
+    const grid = $('grid');
+    if (grid.childElementCount !== st.seats.length) {
+      grid.innerHTML = '';
+      for (const s of st.seats) { const d = document.createElement('div'); d.className = 'seat ' + s.status; d.textContent = s.label; d.title = s.label; grid.appendChild(d); }
+    } else {
+      st.seats.forEach((s, i) => { const d = grid.children[i]; const cls = 'seat ' + s.status; if (d.className !== cls) d.className = cls; });
+    }
+  }
+
+  async function pollShow() {
+    if (!showId) return;
+    try {
+      const r = await fetch('/shows/' + encodeURIComponent(showId));
+      if (!r.ok) { $('status').textContent = `GET /shows/${showId} → ${r.status}`; return; }
+      render(await r.json());
+      $('status').textContent = 'updated ' + new Date().toLocaleTimeString();
+    } catch (e) { $('status').textContent = 'fetch failed: ' + e.message; }
+  }
+
+  const wanted = [
+    ['reservations_confirmed_total', 'Reservations confirmed'],
+    ['reservations_held_total', 'Holds created'],
+    ['reservations_declined_total{reason="seat_taken"}', 'Declined · seat taken'],
+    ['reservations_declined_total{reason="per_user_limit"}', 'Declined · per-user limit'],
+    ['reservations_declined_total{reason="idempotent_replay"}', 'Idempotent replays'],
+    ['reservations_declined_total{reason="idempotency_key_reused"}', 'Declined · key reused w/ different body'],
+    ['reservations_declined_total{reason="unknown_seat"}', 'Declined · unknown seat'],
+    ['reservations_cancelled_total', 'Cancelled'],
+    ['reservations_expired_total', 'Expired holds'],
+    ['db_tx_retries_total', 'DB tx retries'],
+    ['http_requests_in_flight', 'HTTP in flight'],
+    ['db_pool_connections_total', 'DB connections open'],
+  ];
+  async function pollMetrics() {
+    try {
+      const t = await (await fetch('/metrics')).text();
+      const vals = {}; let fivexx = 0;
+      for (const line of t.split('\n')) {
+        if (!line || line[0] === '#') continue;
+        const sp = line.lastIndexOf(' '); const k = line.slice(0, sp), v = parseFloat(line.slice(sp + 1));
+        vals[k] = v;
+        if (k.startsWith('http_requests_total{') && /status="5\d\d"/.test(k)) fivexx += v;
+      }
+      const rows = wanted.map(([k, label]) => `<tr><td>${label}</td><td>${k in vals ? fmt(vals[k]) : '<span class="muted">0</span>'}</td></tr>`);
+      rows.push(`<tr><td>HTTP 5xx responses</td><td class="${fivexx ? 'err' : ''}">${fmt(fivexx)}</td></tr>`);
+      $('metrics').innerHTML = rows.join('');
+    } catch (e) { /* keep last values */ }
+  }
+
+  $('go').onclick = () => { showId = $('showInput').value.trim() || $('showSelect').value; history.replaceState(null, '', '?show=' + showId); $('grid').innerHTML = ''; pollShow(); };
+  $('showSelect').onchange = () => { showId = $('showSelect').value; history.replaceState(null, '', '?show=' + showId); $('grid').innerHTML = ''; pollShow(); };
+
+  loadShows().then(pollShow); pollMetrics();
+  setInterval(pollShow, 1000); setInterval(pollMetrics, 1000); setInterval(loadShows, 10000);
+})();
+</script>
+</body>
+</html>
