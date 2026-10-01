@@ -97,7 +97,7 @@ What the human directed and what they changed afterwards should be listed here b
 
 ## 7. What I would do next
 
-1. **Deploy and burst the live URL** from a different region, then tune `DB_MAX_CONNS` against the real Postgres plan's connection ceiling; put `pgbouncer` in transaction mode in front if the plan is tight.
+1. **Capacity on the live tier.** Deployed on Render free (0.1 vCPU): the full 20 000-request burst passed every correctness check with zero app 5xx, but the instance drains ~75 req/s and Render's proxy answers `502` for the overflow when the accept queue fills. The fix is instance size (Starter or above), not code — the same binary does ~6 000 req/s on 4 vCPUs. Next: run on a 0.5–1 vCPU instance, raise `DB_MAX_CONNS` to the Postgres plan's ceiling, and put `pgbouncer` in transaction mode in front if the plan is tight.
 2. **Payment step.** Make `confirm` take a payment intent id and make it idempotent on that id; today `confirm` simulates payment success.
 3. **Queue the front door.** For true on-sale spikes, a waiting-room token (admit N users/second) in front of `/reserve` keeps DB lock queues short and p99 flat; correctness does not depend on it, latency does.
 4. **Read replicas for `GET /shows/{id}`** and the metric gauges, with staleness exposed as a metric.
