@@ -20,6 +20,7 @@ See [WRITEUP.md](WRITEUP.md) for the design: the atomic decision, lock ordering,
 
 | | |
 |---|---|
+| **Repository** | https://github.com/Ashok190194/Seat-reservation |
 | **Live URL** | _fill in after deploying — see [Deploy](#deploy) below_ |
 | Liveness | `GET /healthz` |
 | Readiness (checks DB, fails closed) | `GET /readyz` |
