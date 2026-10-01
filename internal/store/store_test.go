@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/seatreserve/seatreserve/internal/db"
@@ -33,6 +34,9 @@ func testStore(t *testing.T) (*Store, *pgxpool.Pool) {
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
 	return New(pool, log, nil), pool
 }
+
+// uniq makes identifiers unique per run so tests can share one database.
+func uniq(prefix string) string { return prefix + "-" + uuid.NewString()[:8] }
 
 func labels(n int) []string {
 	out := make([]string, n)
@@ -67,6 +71,7 @@ func TestHotSeatRaceHasExactlyOneWinner(t *testing.T) {
 	s, _ := testStore(t)
 	show := mustShow(t, s, 10, 4, 0)
 	const racers = 200
+	run := uniq("race")
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	winners, taken, other := 0, 0, 0
@@ -74,8 +79,8 @@ func TestHotSeatRaceHasExactlyOneWinner(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			out, err := s.Reserve(context.Background(), ReserveInput{ShowID: show.ID, UserID: fmt.Sprintf("u%d", i), Seats: []string{"S001"},
-				IdempotencyKey: fmt.Sprintf("k%d", i), RequestHash: "h"})
+			out, err := s.Reserve(context.Background(), ReserveInput{ShowID: show.ID, UserID: fmt.Sprintf("%s-u%d", run, i), Seats: []string{"S001"},
+				IdempotencyKey: fmt.Sprintf("%s-k%d", run, i), RequestHash: "h"})
 			mu.Lock()
 			defer mu.Unlock()
 			switch {
@@ -169,7 +174,8 @@ func TestPerUserLimitUnderConcurrency(t *testing.T) {
 func TestIdempotencyExactlyOnceAndMismatch(t *testing.T) {
 	s, _ := testStore(t)
 	show := mustShow(t, s, 5, 4, 0)
-	in := ReserveInput{ShowID: show.ID, UserID: "alice", Seats: []string{"S001"}, IdempotencyKey: "key-1", RequestHash: "hash-A"}
+	alice, bob := uniq("alice"), uniq("bob")
+	in := ReserveInput{ShowID: show.ID, UserID: alice, Seats: []string{"S001"}, IdempotencyKey: "key-1", RequestHash: "hash-A"}
 
 	// 50 concurrent requests with the same key: one creates, the rest replay.
 	var wg sync.WaitGroup
@@ -207,7 +213,7 @@ func TestIdempotencyExactlyOnceAndMismatch(t *testing.T) {
 	}
 	// Same key, different user: keys are scoped per user, so bob gets his own decision (seat taken).
 	in3 := in
-	in3.UserID = "bob"
+	in3.UserID = bob
 	out, err = s.Reserve(context.Background(), in3)
 	if err != nil || out.Decline == nil || out.Decline.Code != "seat_taken" {
 		t.Fatalf("expected seat_taken for bob, got %+v err=%v", out, err)
@@ -224,7 +230,7 @@ func TestDeclinesAreReplayedToo(t *testing.T) {
 	if _, err := s.Reserve(context.Background(), ReserveInput{ShowID: show.ID, UserID: "alice", Seats: []string{"S001"}}); err != nil {
 		t.Fatal(err)
 	}
-	in := ReserveInput{ShowID: show.ID, UserID: "bob", Seats: []string{"S001"}, IdempotencyKey: "k", RequestHash: "h"}
+	in := ReserveInput{ShowID: show.ID, UserID: uniq("bob"), Seats: []string{"S001"}, IdempotencyKey: "k", RequestHash: "h"}
 	first, _ := s.Reserve(context.Background(), in)
 	if first.Decline == nil || first.Decline.Code != "seat_taken" {
 		t.Fatalf("first=%+v", first)
@@ -234,6 +240,33 @@ func TestDeclinesAreReplayedToo(t *testing.T) {
 	if !second.Replayed || second.ReplayStatus != 409 {
 		t.Fatalf("second=%+v", second)
 	}
+}
+
+func TestIdempotencyKeyPurge(t *testing.T) {
+	s, pool := testStore(t)
+	show := mustShow(t, s, 3, 4, 0)
+	ctx := context.Background()
+	alice := uniq("alice")
+	in := ReserveInput{ShowID: show.ID, UserID: alice, Seats: []string{"S001"}, IdempotencyKey: "old-key", RequestHash: "h"}
+	if out, err := s.Reserve(ctx, in); err != nil || out.Reservation == nil {
+		t.Fatalf("out=%+v err=%v", out, err)
+	}
+	// Fresh key is not purged.
+	if n, err := s.PurgeIdempotencyKeys(ctx, 24*time.Hour, 100); err != nil || n != 0 {
+		t.Fatalf("n=%d err=%v", n, err)
+	}
+	// Age it, purge it, and the same key now behaves as a fresh request (seat is taken by alice herself).
+	if _, err := pool.Exec(ctx, `UPDATE idempotency_keys SET created_at = now() - interval '2 days' WHERE user_id = $1 AND key = 'old-key'`, alice); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := s.PurgeIdempotencyKeys(ctx, 24*time.Hour, 100); err != nil || n != 1 {
+		t.Fatalf("n=%d err=%v", n, err)
+	}
+	out, err := s.Reserve(ctx, in)
+	if err != nil || out.Replayed || out.Decline == nil || out.Decline.Code != "seat_taken" {
+		t.Fatalf("expected a fresh seat_taken decision, got %+v err=%v", out, err)
+	}
+	assertInvariant(t, s, show.ID)
 }
 
 func TestHoldExpiryAndNoResurrection(t *testing.T) {
