@@ -42,6 +42,8 @@ jobs:
           for i in $(seq 1 30); do curl -fsS localhost:8787/readyz >/dev/null 2>&1 && break; sleep 1; done
           curl -fsS localhost:8787/readyz
           go run ./cmd/burst -url http://localhost:8787 -requests 2000 -concurrency 100 -hot-users 100 -users 300 -seats 200
+          # Hold mode: every win is a hold that the tool confirms, exercising confirm under load.
+          go run ./cmd/burst -url http://localhost:8787 -requests 1000 -concurrency 50 -hot-users 50 -users 200 -seats 150 -ttl 30
           grep -q '"status":5' /tmp/server.log && { echo "server logged a 5xx"; exit 1; } || true
 
   docker:

@@ -1,0 +1,10 @@
+# Keep the build context to what `go build` needs; never send local secrets or history.
+.git
+.github
+.env
+.env.*
+bin
+dist
+*.test
+*.out
+*.md
