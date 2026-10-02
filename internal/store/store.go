@@ -393,53 +393,58 @@ func (s *Store) ListUserReservations(ctx context.Context, userID, showID string,
 
 // Cancel releases a reservation's seats. Only the owner may cancel. The seat
 // release is guarded by reservation_id, so a stale cancel can never free a
-// seat that has since been sold to someone else.
-func (s *Store) Cancel(ctx context.Context, id, userID string) (*Reservation, error) {
-	return s.transition(ctx, id, userID, func(tx pgx.Tx, res *Reservation) (*Reservation, error) {
+// seat that has since been sold to someone else. changed is false when the
+// reservation was already cancelled (the call is idempotent).
+func (s *Store) Cancel(ctx context.Context, id, userID string) (res *Reservation, changed bool, err error) {
+	return s.transition(ctx, id, userID, func(tx pgx.Tx, res *Reservation) (*Reservation, bool, error) {
 		switch res.Status {
 		case StatusCancelled:
-			return res, nil // idempotent
+			return res, false, nil // idempotent
 		case StatusExpired:
-			return nil, &Decline{HTTPStatus: 409, Code: "reservation_expired", Message: "this hold already expired; nothing to cancel"}
+			return nil, false, &Decline{HTTPStatus: 409, Code: "reservation_expired", Message: "this hold already expired; nothing to cancel"}
 		}
 		if _, err := tx.Exec(ctx, `UPDATE seats SET status = 'available', reservation_id = NULL, user_id = NULL, hold_expires_at = NULL, updated_at = now()
 			WHERE reservation_id = $1`, id); err != nil {
-			return nil, err
+			return nil, false, err
 		}
-		return s.setReservationStatus(ctx, tx, res, StatusCancelled)
+		out, err := s.setReservationStatus(ctx, tx, res, StatusCancelled)
+		return out, err == nil, err
 	})
 }
 
-// Confirm converts a live hold into a confirmed sale.
-func (s *Store) Confirm(ctx context.Context, id, userID string) (*Reservation, error) {
-	return s.transition(ctx, id, userID, func(tx pgx.Tx, res *Reservation) (*Reservation, error) {
+// Confirm converts a live hold into a confirmed sale. changed is false when the
+// reservation was already confirmed, including immediate sales that were never holds.
+func (s *Store) Confirm(ctx context.Context, id, userID string) (res *Reservation, changed bool, err error) {
+	return s.transition(ctx, id, userID, func(tx pgx.Tx, res *Reservation) (*Reservation, bool, error) {
 		switch res.Status {
 		case StatusConfirmed:
-			return res, nil // idempotent
+			return res, false, nil // idempotent
 		case StatusCancelled, StatusExpired:
-			return nil, &Decline{HTTPStatus: 409, Code: "reservation_" + res.Status,
+			return nil, false, &Decline{HTTPStatus: 409, Code: "reservation_" + res.Status,
 				Message: "this reservation is " + res.Status + " and cannot be confirmed"}
 		}
 		tag, err := tx.Exec(ctx, `UPDATE seats SET status = 'confirmed', hold_expires_at = NULL, updated_at = now()
 			WHERE reservation_id = $1 AND status = 'held' AND hold_expires_at > now()`, id)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		if int(tag.RowsAffected()) != len(res.Seats) {
 			// Hold lapsed between the sweeper's ticks; let the sweeper finish the job.
-			return nil, &Decline{HTTPStatus: 409, Code: "hold_expired", Message: "this hold has expired and can no longer be confirmed"}
+			return nil, false, &Decline{HTTPStatus: 409, Code: "hold_expired", Message: "this hold has expired and can no longer be confirmed"}
 		}
-		return s.setReservationStatus(ctx, tx, res, StatusConfirmed)
+		out, err := s.setReservationStatus(ctx, tx, res, StatusConfirmed)
+		return out, err == nil, err
 	})
 }
 
 // transition runs an owner-only state change with the global lock order:
 // seat rows first (sorted), then the reservation row.
-func (s *Store) transition(ctx context.Context, id, userID string, fn func(pgx.Tx, *Reservation) (*Reservation, error)) (*Reservation, error) {
+func (s *Store) transition(ctx context.Context, id, userID string, fn func(pgx.Tx, *Reservation) (*Reservation, bool, error)) (*Reservation, bool, error) {
 	if _, err := uuid.Parse(id); err != nil {
-		return nil, ErrNotFound
+		return nil, false, ErrNotFound
 	}
 	var result *Reservation
+	var changed bool
 	err := s.withRetry(ctx, func() error {
 		tx, err := s.pool.Begin(ctx)
 		if err != nil {
@@ -466,18 +471,26 @@ func (s *Store) transition(ctx context.Context, id, userID string, fn func(pgx.T
 		if err != nil {
 			return err
 		}
-		result, err = fn(tx, res)
+		result, changed, err = fn(tx, res)
 		if err != nil {
+			changed = false
 			return err
 		}
 		return tx.Commit(ctx)
 	})
-	return result, err
+	if err != nil {
+		return nil, false, err
+	}
+	return result, changed, nil
 }
 
+// setReservationStatus records a transition. A confirmed reservation no longer
+// expires, so its hold deadline is cleared rather than left looking live.
 func (s *Store) setReservationStatus(ctx context.Context, tx pgx.Tx, res *Reservation, status string) (*Reservation, error) {
-	err := tx.QueryRow(ctx, `UPDATE reservations SET status = $2, updated_at = now() WHERE id = $1 RETURNING updated_at`,
-		res.ID, status).Scan(&res.UpdatedAt)
+	err := tx.QueryRow(ctx, `UPDATE reservations SET status = $2, updated_at = now(),
+			expires_at = CASE WHEN $2 = 'confirmed' THEN NULL ELSE expires_at END
+		WHERE id = $1 RETURNING expires_at, updated_at`,
+		res.ID, status).Scan(&res.ExpiresAt, &res.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}

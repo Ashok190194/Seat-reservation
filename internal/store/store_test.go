@@ -296,7 +296,7 @@ func TestHoldExpiryAndNoResurrection(t *testing.T) {
 		t.Fatalf("available=%d", c.Available)
 	}
 	// Confirm after expiry must fail.
-	if _, err := s.Confirm(ctx, hold.ID, "alice"); err == nil {
+	if _, _, err := s.Confirm(ctx, hold.ID, "alice"); err == nil {
 		t.Fatal("confirm of expired hold should fail")
 	}
 	// Bob takes the seat; alice's stale cancel must not free it.
@@ -304,7 +304,7 @@ func TestHoldExpiryAndNoResurrection(t *testing.T) {
 	if err != nil || out2.Reservation == nil {
 		t.Fatalf("bob: %+v %v", out2, err)
 	}
-	if _, err := s.Cancel(ctx, hold.ID, "alice"); err == nil {
+	if _, _, err := s.Cancel(ctx, hold.ID, "alice"); err == nil {
 		t.Fatal("cancel of expired hold should be declined")
 	}
 	c = assertInvariant(t, s, show.ID)
@@ -312,15 +312,19 @@ func TestHoldExpiryAndNoResurrection(t *testing.T) {
 		t.Fatalf("counts=%+v", c)
 	}
 	// Bob confirms, then only bob can cancel.
-	if _, err := s.Confirm(ctx, out2.Reservation.ID, "bob"); err != nil {
+	if _, changed, err := s.Confirm(ctx, out2.Reservation.ID, "bob"); err != nil || !changed {
 		t.Fatal(err)
 	}
-	if _, err := s.Cancel(ctx, out2.Reservation.ID, "alice"); err != ErrForbidden {
+	if _, _, err := s.Cancel(ctx, out2.Reservation.ID, "alice"); err != ErrForbidden {
 		t.Fatalf("expected ErrForbidden, got %v", err)
 	}
-	res, err := s.Cancel(ctx, out2.Reservation.ID, "bob")
-	if err != nil || res.Status != StatusCancelled {
-		t.Fatalf("res=%+v err=%v", res, err)
+	res, changed, err := s.Cancel(ctx, out2.Reservation.ID, "bob")
+	if err != nil || !changed || res.Status != StatusCancelled {
+		t.Fatalf("res=%+v changed=%v err=%v", res, changed, err)
+	}
+	// A repeat cancel is a no-op: same answer, nothing changed.
+	if res, changed, err := s.Cancel(ctx, out2.Reservation.ID, "bob"); err != nil || changed || res.Status != StatusCancelled {
+		t.Fatalf("repeat cancel: res=%+v changed=%v err=%v", res, changed, err)
 	}
 	c = assertInvariant(t, s, show.ID)
 	if c.Available != 3 {

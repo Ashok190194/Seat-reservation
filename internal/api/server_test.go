@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -223,6 +224,24 @@ func TestReadinessFailsClosedBeforeBootstrap(t *testing.T) {
 	}
 }
 
+// metric reads one series from /metrics (0 if absent).
+func metric(t *testing.T, srv *httptest.Server, series string) float64 {
+	t.Helper()
+	r, err := http.Get(srv.URL + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Body.Close()
+	b, _ := io.ReadAll(r.Body)
+	for _, line := range strings.Split(string(b), "\n") {
+		if strings.HasPrefix(line, series+" ") {
+			v, _ := strconv.ParseFloat(strings.TrimSpace(line[len(series):]), 64)
+			return v
+		}
+	}
+	return 0
+}
+
 func TestShowIDSpellingsAreOneShow(t *testing.T) {
 	srv, _ := testServer(t)
 	show := createShow(t, srv, `{"name":"spell","seats":["A1","A2","A3"],"price_paise":100}`)
@@ -303,5 +322,46 @@ func TestUnstorableInputIsAClientError(t *testing.T) {
 	}
 	if r := call(t, srv, "POST", "/shows", adminToken, `{"name":"bad\u0000name","seats":["A1"],"price_paise":1}`, nil); r.code != 400 {
 		t.Errorf("NUL in show name: %d", r.code)
+	}
+}
+
+func TestRepeatConfirmAndCancelDoNotInflateCounters(t *testing.T) {
+	srv, _ := testServer(t)
+	show := createShow(t, srv, `{"name":"counters","seats":["A1","A2"],"price_paise":100}`)
+	tok := token(t, srv, "counters-"+show[:8])
+	r := call(t, srv, "POST", "/shows/"+show+"/reserve", tok, `{"seats":["A1"]}`, nil)
+	if r.code != 201 {
+		t.Fatalf("reserve: %d %v", r.code, r.body)
+	}
+	id := r.body["reservation_id"].(string)
+	confirmed := metric(t, srv, "reservations_confirmed_total")
+	holds := metric(t, srv, "holds_confirmed_total")
+	// Confirming an immediate sale is an idempotent no-op: 200, counters unchanged.
+	for i := 0; i < 3; i++ {
+		if r := call(t, srv, "POST", "/reservations/"+id+"/confirm", tok, "", nil); r.code != 200 {
+			t.Fatalf("confirm: %d %v", r.code, r.body)
+		}
+	}
+	if d := metric(t, srv, "reservations_confirmed_total") - confirmed; d != 0 {
+		t.Errorf("reservations_confirmed_total moved by %v on no-op confirms", d)
+	}
+	if d := metric(t, srv, "holds_confirmed_total") - holds; d != 0 {
+		t.Errorf("holds_confirmed_total moved by %v on no-op confirms", d)
+	}
+	cancelled := metric(t, srv, "reservations_cancelled_total")
+	for i := 0; i < 3; i++ {
+		if r := call(t, srv, "POST", "/reservations/"+id+"/cancel", tok, "", nil); r.code != 200 || r.body["status"] != "cancelled" {
+			t.Fatalf("cancel: %d %v", r.code, r.body)
+		}
+	}
+	if d := metric(t, srv, "reservations_cancelled_total") - cancelled; d != 1 {
+		t.Errorf("reservations_cancelled_total moved by %v for one real cancel and two no-ops", d)
+	}
+	// Reservation ids get the same canonical treatment as show ids.
+	if r := call(t, srv, "GET", "/reservations/"+strings.ToUpper(id), tok, "", nil); r.code != 200 {
+		t.Errorf("GET upper-case reservation id: %d", r.code)
+	}
+	if r := call(t, srv, "POST", "/reservations/urn:uuid:"+id+"/cancel", tok, "", nil); r.code != 404 {
+		t.Errorf("cancel urn id: %d", r.code)
 	}
 }

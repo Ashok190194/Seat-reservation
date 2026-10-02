@@ -435,6 +435,9 @@ func (s *Server) getReservation(w http.ResponseWriter, r *http.Request) {
 	s.writeReservationResult(w, r, res, err)
 }
 
+// cancel and confirm are idempotent: repeating one returns 200 with the
+// current state. Counters and lifecycle logs move only when the state
+// actually changed, so they keep reconciling with the database.
 func (s *Server) cancel(w http.ResponseWriter, r *http.Request) {
 	user, ok := s.requireUser(w, r)
 	if !ok {
@@ -444,8 +447,8 @@ func (s *Server) cancel(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	res, err := s.store.Cancel(r.Context(), id, user)
-	if s.writeReservationResult(w, r, res, err) && res.Status == store.StatusCancelled {
+	res, changed, err := s.store.Cancel(r.Context(), id, user)
+	if s.writeReservationResult(w, r, res, err) && changed {
 		s.metrics.ReservationsCancelled.Inc()
 		annotate(r, "", "cancelled")
 		s.log.Info("reservation cancelled", "request_id", RequestID(r), "reservation_id", res.ID, "show_id", res.ShowID, "user_id", user, "seats", res.Seats)
@@ -461,8 +464,8 @@ func (s *Server) confirm(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	res, err := s.store.Confirm(r.Context(), id, user)
-	if s.writeReservationResult(w, r, res, err) && res.Status == store.StatusConfirmed {
+	res, changed, err := s.store.Confirm(r.Context(), id, user)
+	if s.writeReservationResult(w, r, res, err) && changed {
 		s.metrics.HoldsConfirmed.Inc()
 		s.metrics.ReservationsConfirmed.Inc()
 		annotate(r, "", "hold_confirmed")
