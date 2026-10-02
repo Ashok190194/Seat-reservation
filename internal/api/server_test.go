@@ -365,3 +365,22 @@ func TestRepeatConfirmAndCancelDoNotInflateCounters(t *testing.T) {
 		t.Errorf("cancel urn id: %d", r.code)
 	}
 }
+
+func TestShowSizeAndPriceLimits(t *testing.T) {
+	srv, _ := testServer(t)
+	labels := make([]string, 20000)
+	for i := range labels {
+		labels[i] = `"R` + strconv.Itoa(i/100) + `-S` + strconv.Itoa(i%100) + `"`
+	}
+	body := `{"name":"big","seats":[` + strings.Join(labels, ",") + `],"price_paise":100}`
+	if r := call(t, srv, "POST", "/shows", adminToken, body, nil); r.code != 201 || r.body["total_seats"] != float64(20000) {
+		t.Fatalf("20,000-seat show (%d bytes): %d %v", len(body), r.code, errCode(r))
+	}
+	huge := `{"name":"huge","seats":["` + strings.Repeat("x", 3<<20) + `"],"price_paise":1}`
+	if r := call(t, srv, "POST", "/shows", adminToken, huge, nil); r.code != 413 || errCode(r) != "payload_too_large" {
+		t.Errorf("oversized body: %d %q", r.code, errCode(r))
+	}
+	if r := call(t, srv, "POST", "/shows", adminToken, `{"name":"pricey","seats":["A1"],"price_paise":4611686018427387904}`, nil); r.code != 400 {
+		t.Errorf("price above cap: %d", r.code)
+	}
+}

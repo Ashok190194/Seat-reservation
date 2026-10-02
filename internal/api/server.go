@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -35,12 +36,16 @@ var dashboardHTML []byte
 
 const (
 	maxBodyBytes      = 64 << 10
+	maxShowBodyBytes  = 2 << 20 // 20,000 labels of 32 bytes is ~700 KB of JSON
 	maxSeatsPerShow   = 20000
 	maxSeatLabelLen   = 32
 	maxIdemKeyLen     = 128
 	defaultUserLimit  = 4
 	maxPerUserLimit   = 100
 	maxHoldTTLSeconds = 86400
+	// ₹10 crore per seat. With at most 100 seats per request the amount stays
+	// far below the int64 limit, so price × seats can never wrap.
+	maxPricePaise = 10_000_000_000
 )
 
 type Server struct {
@@ -126,16 +131,17 @@ func (s *Server) issueToken(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		UserID string `json:"user_id"`
 	}
-	if !decodeBody(w, r, &body) {
+	if !decodeBody(w, r, &body, maxBodyBytes) {
 		return
 	}
-	tok, err := s.auth.Issue(strings.TrimSpace(body.UserID))
+	userID := strings.TrimSpace(body.UserID)
+	tok, err := s.auth.Issue(userID)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_user_id", err.Error())
 		return
 	}
-	annotate(r, body.UserID, "token_issued")
-	writeJSON(w, http.StatusCreated, map[string]string{"user_id": body.UserID, "token": tok, "token_type": "Bearer"})
+	annotate(r, userID, "token_issued")
+	writeJSON(w, http.StatusCreated, map[string]string{"user_id": userID, "token": tok, "token_type": "Bearer"})
 }
 
 // requireUser returns the token's user id or writes a 401.
@@ -178,7 +184,7 @@ func (s *Server) createShow(w http.ResponseWriter, r *http.Request) {
 		PerUserLimit   *int     `json:"per_user_limit"`
 		HoldTTLSeconds *int     `json:"hold_ttl_seconds"`
 	}
-	if !decodeBody(w, r, &body) {
+	if !decodeBody(w, r, &body, maxShowBodyBytes) {
 		return
 	}
 	body.Name = strings.TrimSpace(body.Name)
@@ -186,8 +192,8 @@ func (s *Server) createShow(w http.ResponseWriter, r *http.Request) {
 	case body.Name == "" || len(body.Name) > 200 || !printableText(body.Name):
 		writeError(w, http.StatusBadRequest, "invalid_request", "name is required (1-200 bytes of printable text)")
 		return
-	case body.PricePaise == nil || *body.PricePaise < 0:
-		writeError(w, http.StatusBadRequest, "invalid_request", "price_paise is required and must be a non-negative integer")
+	case body.PricePaise == nil || *body.PricePaise < 0 || *body.PricePaise > maxPricePaise:
+		writeError(w, http.StatusBadRequest, "invalid_request", "price_paise is required and must be an integer from 0 to 10000000000")
 		return
 	case len(body.Seats) == 0 || len(body.Seats) > maxSeatsPerShow:
 		writeError(w, http.StatusBadRequest, "invalid_request", "seats must contain between 1 and 20000 labels")
@@ -274,7 +280,7 @@ func (s *Server) reserve(w http.ResponseWriter, r *http.Request) {
 		IdempotencyKey *string  `json:"idempotency_key"`
 		// user_id is deliberately not read: identity is the token's, full stop.
 	}
-	if !decodeBody(w, r, &body) {
+	if !decodeBody(w, r, &body, maxBodyBytes) {
 		s.metrics.ReservationsDeclined.WithLabelValues(metrics.ReasonInvalidRequest).Inc()
 		return
 	}
@@ -519,15 +525,19 @@ func (s *Server) serverError(w http.ResponseWriter, r *http.Request, op string, 
 	writeError(w, http.StatusServiceUnavailable, "unavailable", "the service could not complete the request; retry with the same idempotency key")
 }
 
-func decodeBody(w http.ResponseWriter, r *http.Request, dst any) bool {
-	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+func decodeBody(w http.ResponseWriter, r *http.Request, dst any, limit int64) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
 	dec := json.NewDecoder(r.Body)
 	if err := dec.Decode(dst); err != nil {
-		if errors.Is(err, io.EOF) {
+		var tooBig *http.MaxBytesError
+		switch {
+		case errors.As(err, &tooBig):
+			writeError(w, http.StatusRequestEntityTooLarge, "payload_too_large", fmt.Sprintf("request body is larger than %d bytes", tooBig.Limit))
+		case errors.Is(err, io.EOF):
 			writeError(w, http.StatusBadRequest, "invalid_request", "request body is required")
-			return false
+		default:
+			writeError(w, http.StatusBadRequest, "invalid_request", "malformed JSON body: "+err.Error())
 		}
-		writeError(w, http.StatusBadRequest, "invalid_request", "malformed JSON body: "+err.Error())
 		return false
 	}
 	return true
