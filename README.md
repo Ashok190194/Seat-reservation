@@ -150,6 +150,17 @@ Sample output against a local instance (Postgres 16, pool of 16, default flags e
   ✓ all checks passed
 ```
 
+### Audit the database
+
+Two read-only psql scripts check a deployment from the database side:
+
+```bash
+psql "$DATABASE_URL" -f scripts/db-audit.sql   # invariants, no double-sell, seats vs reservations, limits, money
+psql "$DATABASE_URL" -f scripts/db-locks.sql   # run during a burst to watch the row-lock queue (Ctrl+C to stop)
+```
+
+Every audit query states its expected result; on the live database all of them came back clean on 2 Oct 2026.
+
 Tests (`make test`, needs `DATABASE_URL`; CI adds the race detector) cover the same invariants in-process: 200-way single-seat race, opposite-order multi-seat requests, per-user limit under concurrency (also across differently spelled show ids), 50 concurrent same-key requests, decline replay, hold expiry / no-resurrection, sweeper-vs-reserve deadlock freedom, counters that move only on real transitions, unstorable input as 400, the 20,000-seat body limit, the database gauges and the log endpoint.
 
 ---
@@ -306,6 +317,7 @@ internal/store    every transaction: reserve, cancel, confirm, sweep (the correc
 internal/db       pool + embedded idempotent schema
 internal/auth     HMAC bearer tokens, admin token
 internal/logbuf   in-memory ring of recent log lines served at GET /logs
+scripts           read-only psql scripts: db-audit.sql (invariants) and db-locks.sql (lock queue during a burst)
 internal/metrics  Prometheus registry; seat gauges are a live DB collector
 openapi.yaml      OpenAPI 3.1 description of the API
 .github/workflows CI: gofmt, vet, race tests against Postgres, smoke burst, Docker build
