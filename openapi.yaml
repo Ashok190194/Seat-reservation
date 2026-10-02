@@ -7,6 +7,8 @@ info:
     only from the bearer token; a `user_id` in a request body is ignored.
     Declines are 4xx domain outcomes with `{"error":{"code":...}}`; the service
     does not return 5xx for contention. Every response carries `X-Request-ID`.
+    Show and reservation ids are UUIDs: any letter case is accepted and
+    canonicalised; other spellings (urn:uuid:, braces, no hyphens) are 404.
 servers:
   - url: https://seat-reservation-8wdh.onrender.com
   - url: http://localhost:8787
@@ -26,8 +28,8 @@ components:
       name: Idempotency-Key
       in: header
       required: false
-      schema: { type: string, maxLength: 128 }
-      description: Optional. Same key + same body replays the original response; same key + different body is 409.
+      schema: { type: string, maxLength: 128, pattern: '^[\x20-\x7E]+$' }
+      description: Optional, printable ASCII. Same key + same body replays the original response; same key + different body is 409; a key that is present but blank is 400.
   schemas:
     Error:
       type: object
@@ -40,7 +42,8 @@ components:
               type: string
               enum: [seat_taken, per_user_limit, idempotency_key_reused, unknown_seat, show_not_found,
                      reservation_not_found, reservation_expired, reservation_cancelled, hold_expired,
-                     invalid_request, unauthorized, forbidden, not_found, unavailable, internal_error]
+                     invalid_request, invalid_user_id, payload_too_large, unauthorized, forbidden, not_found,
+                     unavailable, internal_error]
             message: { type: string }
             seats:
               type: array
@@ -74,6 +77,24 @@ components:
             properties:
               label: { type: string }
               status: { $ref: '#/components/schemas/SeatStatus' }
+    ShowSummary:
+      type: object
+      description: A show with its counts but without the per-seat list.
+      required: [id, name, price_paise, per_user_limit, hold_ttl_seconds, total_seats, counts]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        price_paise: { type: integer, format: int64 }
+        per_user_limit: { type: integer }
+        hold_ttl_seconds: { type: integer }
+        total_seats: { type: integer }
+        created_at: { type: string, format: date-time }
+        counts:
+          type: object
+          properties:
+            available: { type: integer }
+            held: { type: integer }
+            confirmed: { type: integer }
     Reservation:
       type: object
       required: [reservation_id, show_id, user_id, seats, amount_paise, status]
@@ -84,7 +105,7 @@ components:
         seats: { type: array, items: { type: string } }
         amount_paise: { type: integer, format: int64 }
         status: { type: string, enum: [held, confirmed, cancelled, expired] }
-        expires_at: { type: [string, 'null'], format: date-time }
+        expires_at: { type: [string, 'null'], format: date-time, description: Hold deadline; null for confirmed reservations. }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
   responses:
@@ -96,6 +117,12 @@ components:
       content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
     NotFound:
       description: Not found.
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    TooLarge:
+      description: payload_too_large (64 KiB for reserve, 2 MiB for POST /shows).
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Unavailable:
+      description: unavailable. The database failed and nothing was committed; retrying with the same idempotency key is safe.
       content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
 
 paths:
@@ -110,12 +137,32 @@ paths:
       description: 200 only when the schema is applied and the database answers SELECT 1 within 2s.
       responses:
         '200': { description: Ready. }
-        '503': { description: Database unreachable or schema not yet applied. }
+        '503': { description: Database unreachable, schema not yet applied, or the process is draining after SIGTERM. }
   /metrics:
     get:
       summary: Prometheus metrics
+      description: Counters are per process and reset on restart; seats_by_status, reservations_by_status and seat_reservation_mismatches are read from the database on every scrape.
       responses:
         '200': { description: Prometheus text exposition format., content: { text/plain: {} } }
+  /logs:
+    get:
+      summary: Recent log lines of this instance (public)
+      description: The newest JSON log lines from a 2,000-line in-memory buffer that empties on restart, oldest first. Pass `next` back as `after` to tail.
+      parameters:
+        - { name: request_id, in: query, required: false, schema: { type: string } }
+        - { name: q, in: query, required: false, schema: { type: string }, description: Substring filter. }
+        - { name: limit, in: query, required: false, schema: { type: integer, default: 200, maximum: 2000 } }
+        - { name: after, in: query, required: false, schema: { type: integer }, description: Only lines newer than this sequence number. }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  next: { type: integer, description: Sequence number of the newest line in the buffer. }
+                  lines: { type: array, items: { type: object } }
 
   /auth/token:
     post:
@@ -153,7 +200,7 @@ paths:
               schema:
                 type: object
                 properties:
-                  shows: { type: array, items: { $ref: '#/components/schemas/Show' } }
+                  shows: { type: array, items: { $ref: '#/components/schemas/ShowSummary' } }
     post:
       summary: Create a show (admin)
       security: [ { adminToken: [] } ]
@@ -166,14 +213,15 @@ paths:
               required: [name, seats, price_paise]
               properties:
                 name: { type: string, maxLength: 200 }
-                seats: { type: array, minItems: 1, maxItems: 20000, items: { type: string, maxLength: 32 }, description: Unique labels. }
-                price_paise: { type: integer, format: int64, minimum: 0 }
+                seats: { type: array, minItems: 1, maxItems: 20000, items: { type: string, maxLength: 32 }, description: 'Unique labels of printable text, at most 32 bytes each; the whole body may be up to 2 MiB.' }
+                price_paise: { type: integer, format: int64, minimum: 0, maximum: 10000000000 }
                 per_user_limit: { type: integer, minimum: 1, maximum: 100, default: 4 }
                 hold_ttl_seconds: { type: integer, minimum: 0, maximum: 86400, default: 0 }
       responses:
         '201': { description: Created., content: { application/json: { schema: { $ref: '#/components/schemas/Show' } } } }
         '400': { description: Validation error., content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '413': { $ref: '#/components/responses/TooLarge' }
 
   /shows/{id}:
     get:
@@ -202,15 +250,17 @@ paths:
               type: object
               required: [seats]
               properties:
-                seats: { type: array, minItems: 1, items: { type: string } }
-                idempotency_key: { type: string, maxLength: 128, description: Alternative to the header. }
+                seats: { type: array, minItems: 1, maxItems: 100, items: { type: string }, description: Duplicates collapse; order does not matter. }
+                idempotency_key: { type: string, maxLength: 128, description: Alternative to the header; printable ASCII. }
       responses:
         '201': { description: Reserved (or replayed)., content: { application/json: { schema: { $ref: '#/components/schemas/Reservation' } } } }
         '400': { description: invalid_request, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { description: show_not_found, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
         '409': { description: seat_taken | per_user_limit | idempotency_key_reused, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '413': { $ref: '#/components/responses/TooLarge' }
         '422': { description: unknown_seat, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '503': { $ref: '#/components/responses/Unavailable' }
 
   /users/me/reservations:
     get:
