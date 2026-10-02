@@ -109,15 +109,17 @@ func TestHotSeatRaceHasExactlyOneWinner(t *testing.T) {
 func TestMultiSeatOppositeOrderNoDeadlockAllOrNothing(t *testing.T) {
 	s, _ := testStore(t)
 	show := mustShow(t, s, 4, 4, 0)
-	// Caller is required to sort; the store relies on ORDER BY as well. Both
-	// requests want the same two seats: exactly one wins both, the other gets neither.
+	// The two requests list the same seats in opposite orders. Locks are taken
+	// by ORDER BY label inside Postgres, so the order in the request does not
+	// matter: exactly one wins both seats, the other gets neither.
+	orders := [][]string{{"S001", "S002"}, {"S002", "S001"}}
 	var wg sync.WaitGroup
 	results := make([]*ReserveOutcome, 2)
 	for i := 0; i < 2; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			out, err := s.Reserve(context.Background(), ReserveInput{ShowID: show.ID, UserID: fmt.Sprintf("u%d", i), Seats: []string{"S001", "S002"}})
+			out, err := s.Reserve(context.Background(), ReserveInput{ShowID: show.ID, UserID: fmt.Sprintf("u%d", i), Seats: orders[i]})
 			if err != nil {
 				t.Error(err)
 				return
@@ -287,9 +289,19 @@ func TestHoldExpiryAndNoResurrection(t *testing.T) {
 	if _, err := pool.Exec(ctx, `UPDATE seats SET hold_expires_at = now() - interval '1 second' WHERE reservation_id = $1`, hold.ID); err != nil {
 		t.Fatal(err)
 	}
-	seats, reservations, err := s.SweepExpired(ctx, 100)
-	if err != nil || seats != 1 || reservations != 1 {
-		t.Fatalf("seats=%d reservations=%d err=%v", seats, reservations, err)
+	// The sweeper is global, and a shared test database can hold other runs'
+	// expired holds, so sweep until nothing is left and then check this show.
+	for {
+		n, _, err := s.SweepExpired(ctx, 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n == 0 {
+			break
+		}
+	}
+	if got, err := s.GetReservation(ctx, hold.ID, "alice"); err != nil || got.Status != StatusExpired {
+		t.Fatalf("hold after sweep: %+v err=%v", got, err)
 	}
 	c = assertInvariant(t, s, show.ID)
 	if c.Available != 3 {
