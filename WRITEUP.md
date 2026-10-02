@@ -101,7 +101,14 @@ Counters reset on every deploy; `reservations_by_status` and `seat_reservation_m
 - **Wrote** the service, the schema, the burst tool, the tests, the Docker/Render/Fly configs, and the first version of these documents.
 - **Found and fixed** two bugs by running the code: the sweeper's `RETURNING reservation_id` returning the post-update `NULL` (fixed with a CTE), and JSONB normalising stored responses so replays were not byte-identical (fixed by storing `TEXT`).
 
-**Deployment.** I deployed it on Render from the blueprint, and the burst was run against the live URL (results in 40bd70c).
+**Deployment, testing, and the questions I asked.** I deployed it on Render from the blueprint and tested it against the live URL rather than taking the agent's account on trust. I asked a lot of questions along the way, about each part of the design, until I could explain it myself: why the read is the lock, why seats are locked in label order, why the per-user limit needs an advisory lock, what a retry sees after a crash, and how to prove the invariants from the database instead of from the counters. Testing turned up real issues:
+
+- **Edge 502s under the burst.** The full 20,000-request run against the free instance produced 3,270 × 502 from Render's proxy while the app itself returned no 5xx. That led to the burst tool telling edge errors apart from app errors (40bd70c), and later to measuring the cause: 0.1 vCPU, about 65 reserves per second, and the database idle in transaction while it waits on the app.
+- **Counters at zero next to a sold-out show.** After a redeploy the dashboard showed every reservation counter at 0 while the show had 1,000 confirmed seats, because the counters live in process memory. That led to the database-derived gauges (f09db64) and the "counters since restart" note on the dashboard.
+- **Cold starts.** The free instance sleeps after 15 idle minutes and takes about a minute to wake, so a burst fired at it first meets the spin-up; the README now tells graders to wait for `/readyz`.
+- **Logs graders cannot see.** Render's log viewer is private to my account, which is why `/logs` exists.
+
+I then asked for an end-to-end review of the running system, including the database I will show in the interview.
 
 **Review and fixes (1–2 Oct, Claude Code).** I then used Claude Code to review the running system and the code: reviewer agents that ran experiments against a local Postgres, a read-only audit of the live database (no violations), lock sampling with `pg_stat_activity` during a live burst, and a CPU profile. Every commit from 1a871d1 onwards came out of that pass, each with its own tests:
 
