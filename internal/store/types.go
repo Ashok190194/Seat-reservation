@@ -88,6 +88,13 @@ func perUserLimit(limit, holding, requested int) *Decline {
 		Message: fmt.Sprintf("per-user limit is %d seats for this show; you hold %d and asked for %d more", limit, holding, requested)}
 }
 
+// tooManySeats is the lock-free early check: no amount of waiting makes the
+// request fit, so it is declined before any lock is taken.
+func tooManySeats(limit, requested int) *Decline {
+	return &Decline{HTTPStatus: http.StatusConflict, Code: "per_user_limit",
+		Message: fmt.Sprintf("per-user limit is %d seats for this show; this request asks for %d", limit, requested)}
+}
+
 func unknownSeat(seats []string) *Decline {
 	return &Decline{HTTPStatus: http.StatusUnprocessableEntity, Code: "unknown_seat",
 		Message: "one or more requested seats do not exist in this show", Seats: seats}

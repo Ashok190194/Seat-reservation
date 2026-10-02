@@ -18,6 +18,10 @@ import (
 var (
 	ErrNotFound  = errors.New("not found")
 	ErrForbidden = errors.New("forbidden")
+
+	// errKeyVanished: the key row we conflicted with was purged before we could
+	// read it. The transaction is simply retried, and then inserts the key fresh.
+	errKeyVanished = errors.New("idempotency key purged during replay")
 )
 
 type Store struct {
@@ -200,6 +204,9 @@ func (s *Store) reserveOnce(ctx context.Context, in ReserveInput) (*ReserveOutco
 			var body string
 			err := tx.QueryRow(ctx, `SELECT request_hash, response_code, response_body FROM idempotency_keys
 				WHERE user_id = $1 AND key = $2`, in.UserID, in.IdempotencyKey).Scan(&hash, &code, &body)
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil, errKeyVanished
+			}
 			if err != nil {
 				return nil, err
 			}
@@ -249,7 +256,7 @@ func (s *Store) reserveOnce(ctx context.Context, in ReserveInput) (*ReserveOutco
 		return nil, err
 	}
 	if len(in.Seats) > limit {
-		return decline(perUserLimit(limit, 0, len(in.Seats)))
+		return decline(tooManySeats(limit, len(in.Seats)))
 	}
 
 	// Serialise this user's concurrent requests for this show so the limit
@@ -595,6 +602,9 @@ func (s *Store) withRetry(ctx context.Context, fn func() error) error {
 }
 
 func isTransient(err error) bool {
+	if errors.Is(err, errKeyVanished) {
+		return true
+	}
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
 		switch pgErr.Code {
