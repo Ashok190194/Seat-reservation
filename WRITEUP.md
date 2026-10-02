@@ -108,9 +108,7 @@ Counters reset on every deploy; `reservations_by_status` and `seat_reservation_m
 - **Cold starts.** The free instance sleeps after 15 idle minutes and takes about a minute to wake, so a burst fired at it first meets the spin-up; the README now tells graders to wait for `/readyz`.
 - **Logs graders cannot see.** Render's log viewer is private to my account, which is why `/logs` exists.
 
-I then asked for an end-to-end review of the running system, including the database I will show in the interview.
-
-**Review and fixes (1–2 Oct, Claude Code).** I then used Claude Code to review the running system and the code: reviewer agents that ran experiments against a local Postgres, a read-only audit of the live database (no violations), lock sampling with `pg_stat_activity` during a live burst, and a CPU profile. Every commit from 1a871d1 onwards came out of that pass, each with its own tests:
+**Review and fixes (1–2 Oct, Claude Code).** Next I had Claude Code review the running system end to end, including the code and the database I will show in the interview: reviewer agents that ran experiments against a local Postgres, a read-only audit of the live database (no violations), lock sampling with `pg_stat_activity` during a live burst, and a CPU profile. Every commit from 1a871d1 onwards came out of that pass, each with its own tests:
 
 - per-user limit bypass through differently spelled show ids (d205693);
 - app 503s for NUL bytes, invalid UTF-8 and `urn:uuid:` ids, now 400/404 (60193e7, d205693);
