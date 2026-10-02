@@ -80,11 +80,12 @@ type client struct {
 }
 
 type result struct {
-	status  int
-	code    string // domain code from error body, "" on success
-	body    []byte
-	latency time.Duration
-	err     error
+	status   int
+	code     string // domain code from error body, "" on success
+	body     []byte
+	replayed bool // Idempotent-Replayed: true, i.e. a stored answer, not a new decision
+	latency  time.Duration
+	err      error
 }
 
 func newClient(base string, concurrency int) *client {
@@ -123,6 +124,7 @@ func (c *client) do(method, path, token string, body any, headers map[string]str
 	}
 	defer resp.Body.Close()
 	r.status = resp.StatusCode
+	r.replayed = resp.Header.Get("Idempotent-Replayed") == "true"
 	r.body, _ = io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if r.status >= 400 {
 		var eb struct {
@@ -162,8 +164,8 @@ type tally struct {
 	mu        sync.Mutex
 	name      string
 	total     int
-	success   int // 201
-	replayed  int // any status with Idempotent-Replayed semantics (we detect via header-less: tracked by caller)
+	success   int         // fresh 201s: new reservations
+	replays   map[int]int // stored answers replayed for a repeated key, by status
 	byCode    map[string]int
 	other4xx  int
 	fivexx    int // 5xx with the app's JSON error body
@@ -174,7 +176,7 @@ type tally struct {
 }
 
 func newTally(name string) *tally {
-	return &tally{name: name, byCode: map[string]int{}, edgeCodes: map[int]int{}}
+	return &tally{name: name, byCode: map[string]int{}, replays: map[int]int{}, edgeCodes: map[int]int{}}
 }
 
 func (t *tally) add(r result) {
@@ -185,6 +187,8 @@ func (t *tally) add(r result) {
 	switch {
 	case r.err != nil:
 		t.transport++
+	case r.replayed:
+		t.replays[r.status]++
 	case r.status == 201:
 		t.success++
 	case r.status >= 500:
@@ -207,7 +211,7 @@ func (t *tally) print(elapsed time.Duration) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	fmt.Printf("\n  %-34s %6d requests in %s (%.0f req/s)\n", t.name, t.total, elapsed.Round(time.Millisecond), float64(t.total)/elapsed.Seconds())
-	fmt.Printf("    %-32s %6d\n", "201 created", t.success)
+	fmt.Printf("    %-32s %6d\n", "201 created (new reservations)", t.success)
 	codes := make([]string, 0, len(t.byCode))
 	for c := range t.byCode {
 		codes = append(codes, c)
@@ -216,8 +220,19 @@ func (t *tally) print(elapsed time.Duration) {
 	for _, c := range codes {
 		fmt.Printf("    %-32s %6d\n", "4xx "+c, t.byCode[c])
 	}
-	if t.replayed > 0 {
-		fmt.Printf("    %-32s %6d\n", "idempotent replays (orig status)", t.replayed)
+	if len(t.replays) > 0 {
+		statuses := make([]int, 0, len(t.replays))
+		total := 0
+		for st, n := range t.replays {
+			statuses = append(statuses, st)
+			total += n
+		}
+		sort.Ints(statuses)
+		parts := make([]string, 0, len(statuses))
+		for _, st := range statuses {
+			parts = append(parts, fmt.Sprintf("%d x %d", t.replays[st], st))
+		}
+		fmt.Printf("    %-32s %6d   (%s)\n", "replayed stored answers", total, strings.Join(parts, ", "))
 	}
 	if t.other4xx > 0 {
 		fmt.Printf("    %-32s %6d\n", "4xx (other)", t.other4xx)
@@ -357,6 +372,24 @@ func run(o options) error {
 		}
 	}
 
+	// In hold mode (-ttl) a 201 is a hold that would lapse if the run outlasts the
+	// TTL, and the seat could then be legitimately sold again. Confirm each new
+	// hold straight away so winners are permanent and the reconciliation stays exact.
+	var confirmLost int32
+	settle := func(tok string, res reservation) bool {
+		if o.ttl == 0 || res.Status != "held" {
+			return true
+		}
+		rr := c.do("POST", "/reservations/"+res.ID+"/confirm", tok, nil, nil)
+		if rr.status == 200 {
+			return true
+		}
+		if rr.err != nil || (rr.status >= 500 && rr.code == "") {
+			atomic.AddInt32(&confirmLost, 1)
+		}
+		return false
+	}
+
 	// 3. hot-seat storm: hotUsers distinct buyers hammer each of hotSeats seats at once.
 	hot := newTally("hot-seat storm")
 	hotWins := make([]int32, o.hotSeats)
@@ -378,7 +411,7 @@ func run(o options) error {
 					if rr.status == 201 {
 						atomic.AddInt32(&hotWins[si], 1)
 						var res reservation
-						if json.Unmarshal(rr.body, &res) == nil {
+						if json.Unmarshal(rr.body, &res) == nil && settle(tok, res) {
 							record(res)
 						}
 					}
@@ -447,7 +480,7 @@ func run(o options) error {
 					if rr.status == 201 {
 						atomic.AddInt32(&won, 1)
 						var res reservation
-						if json.Unmarshal(rr.body, &res) == nil {
+						if json.Unmarshal(rr.body, &res) == nil && settle(t.Token, res) {
 							record(res)
 						}
 					}
@@ -462,6 +495,92 @@ func run(o options) error {
 			}
 		}
 	}
+
+	// 4b. in-flight duplicates: the same (user, key, body) fired in parallel must be
+	// decided exactly once, with every copy getting byte-identical answers; the same
+	// key with other seats must be refused. Retries in the stampede only repeat
+	// requests that already finished, so this is the only phase that races a copy
+	// against its still-open original.
+	dup := newTally("in-flight duplicates (one key)")
+	start = time.Now()
+	{
+		rr := c.do("POST", "/auth/token", "", map[string]string{"user_id": "dup-" + uuid.NewString()[:8]}, nil)
+		var t struct {
+			Token string `json:"token"`
+		}
+		json.Unmarshal(rr.body, &t) //nolint:errcheck
+		st, err := getShow(c, show.ID)
+		if err != nil {
+			return err
+		}
+		var free []string
+		for _, s := range st.Seats {
+			if s.Status == "available" {
+				free = append(free, s.Label)
+			}
+		}
+		if len(free) < 2 {
+			fmt.Println("    (fewer than 2 free seats left; skipping)")
+		} else {
+			key := uuid.NewString()
+			const copies = 30
+			var wg sync.WaitGroup
+			var mu sync.Mutex
+			var answers []result
+			for i := 0; i < copies; i++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					r := c.do("POST", reservePath, t.Token, map[string]any{"seats": []string{free[0]}}, map[string]string{"Idempotency-Key": key})
+					dup.add(r)
+					if r.err == nil && !(r.status >= 500 && r.code == "") {
+						mu.Lock()
+						answers = append(answers, r)
+						mu.Unlock()
+					}
+				}()
+			}
+			wg.Wait()
+			fresh, identical := 0, true
+			for _, a := range answers {
+				if !a.replayed {
+					fresh++
+				}
+				if a.status != answers[0].status || !bytes.Equal(a.body, answers[0].body) {
+					identical = false
+				}
+			}
+			var reused int32
+			for i := 0; i < 10; i++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					r := c.do("POST", reservePath, t.Token, map[string]any{"seats": []string{free[1]}}, map[string]string{"Idempotency-Key": key})
+					dup.add(r)
+					if r.code == "idempotency_key_reused" {
+						atomic.AddInt32(&reused, 1)
+					}
+				}()
+			}
+			wg.Wait()
+			dup.print(time.Since(start))
+			fmt.Printf("    %d parallel copies: %d decided, %d replayed, answers identical: %v; same key + other seat refused %d/10\n",
+				len(answers), fresh, len(answers)-fresh, identical, reused)
+			if len(answers) > 0 {
+				fails.check(fresh == 1, "in-flight duplicates: %d copies were decided afresh (want exactly 1)", fresh)
+				fails.check(identical, "in-flight duplicates: copies of one request got different answers")
+				if fresh == 1 && answers[0].status == 201 {
+					var res reservation
+					if json.Unmarshal(answers[0].body, &res) == nil && settle(t.Token, res) {
+						record(res)
+					}
+				}
+			}
+			fails.check(reused == 10, "same key with other seats: only %d/10 refused with idempotency_key_reused", reused)
+		}
+	}
+	fails.check(dup.fivexx == 0, "in-flight duplicate phase produced %d 5xx", dup.fivexx)
+	warnEdge(dup)
 
 	// 5. general stampede with mixed-in idempotent retries.
 	type sent struct {
@@ -530,7 +649,9 @@ func run(o options) error {
 				if rr.status == 201 {
 					var res reservation
 					if json.Unmarshal(rr.body, &res) == nil {
-						record(res)
+						if settle(tok, res) {
+							record(res)
+						}
 						if res.UserID == "someone-else" {
 							atomic.AddInt32(&replayMismatch, 1<<20) // sentinel: identity spoof succeeded
 						}
@@ -545,7 +666,6 @@ func run(o options) error {
 		}
 		wg.Wait()
 	}
-	gen.replayed = int(replayCount)
 	gen.print(time.Since(start))
 	spoofed := replayMismatch >= 1<<20
 	replayMismatch &= (1 << 20) - 1
@@ -627,7 +747,7 @@ func run(o options) error {
 	winnersMu.Lock()
 	taken := st.Counts.Held + st.Counts.Confirmed
 	fmt.Printf("    seats won by this run (distinct): %d ; seats taken per API: %d  %s\n", len(winners), taken, okMark(len(winners) == taken))
-	lost := hot.edge5xx + hot.transport + gen.edge5xx + gen.transport
+	lost := hot.edge5xx + hot.transport + gen.edge5xx + gen.transport + dup.edge5xx + dup.transport + int(confirmLost)
 	if lost == 0 {
 		fails.check(len(winners) == taken, "client saw %d distinct winning seats but API reports %d taken", len(winners), taken)
 	} else {
