@@ -225,6 +225,50 @@ func TestReadinessFailsClosedBeforeBootstrap(t *testing.T) {
 	}
 }
 
+func TestReadinessFailsWhileDrainingAndHidesDBErrors(t *testing.T) {
+	url := os.Getenv("DATABASE_URL")
+	if url == "" {
+		t.Skip("DATABASE_URL not set; skipping integration test")
+	}
+	ctx := context.Background()
+	pool, err := db.Connect(ctx, url, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	var ready atomic.Bool
+	ready.Store(true)
+	s := New(store.New(pool, log, nil), auth.New("test-secret", adminToken), metrics.New(pool, 10, log), pool, log, &ready)
+	srv := httptest.NewServer(s.Handler())
+	t.Cleanup(srv.Close)
+	s.Drain()
+	if r := call(t, srv, "GET", "/readyz", "", "", nil); r.code != 503 || r.body["status"] != "draining" {
+		t.Fatalf("draining: %d %v", r.code, r.body)
+	}
+	if r := call(t, srv, "GET", "/healthz", "", "", nil); r.code != 200 {
+		t.Fatalf("liveness while draining: %d", r.code)
+	}
+
+	// A pool pointed at nothing: the 503 must not echo the connection details.
+	dead, err := db.Connect(ctx, "postgres://secret_user@127.0.0.1:1/secret_db?sslmode=disable&connect_timeout=1", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(dead.Close)
+	s2 := New(store.New(dead, log, nil), auth.New("test-secret", adminToken), metrics.New(dead, 10, log), dead, log, &ready)
+	srv2 := httptest.NewServer(s2.Handler())
+	t.Cleanup(srv2.Close)
+	r := call(t, srv2, "GET", "/readyz", "", "", nil)
+	body, _ := json.Marshal(r.body)
+	if r.code != 503 || strings.Contains(string(body), "secret_user") || strings.Contains(string(body), "secret_db") {
+		t.Fatalf("readyz with dead DB: %d %s", r.code, body)
+	}
+}
+
 func TestLogsEndpointServesRecentLinesByRequestID(t *testing.T) {
 	url := os.Getenv("DATABASE_URL")
 	if url == "" {

@@ -62,7 +62,13 @@ type Server struct {
 	ready *atomic.Bool
 	// logs holds this instance's recent log lines for GET /logs (nil disables it).
 	logs *logbuf.Ring
+	// draining is set on SIGTERM so /readyz fails while in-flight requests finish.
+	draining atomic.Bool
 }
+
+// Drain makes /readyz report 503 so the platform stops routing new requests
+// here while the server finishes the ones it has.
+func (s *Server) Drain() { s.draining.Store(true) }
 
 func New(st *store.Store, a *auth.Authenticator, m *metrics.Metrics, pool *pgxpool.Pool, log *slog.Logger, ready *atomic.Bool) *Server {
 	return &Server{store: st, auth: a, metrics: m, pool: pool, log: log, ready: ready}
@@ -106,6 +112,12 @@ func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
 // readyz fails closed: if the database cannot answer SELECT 1 within 2s we
 // report 503 so the platform stops routing traffic to this instance.
 func (s *Server) readyz(w http.ResponseWriter, r *http.Request) {
+	if s.draining.Load() {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"status": "draining", "checks": map[string]any{"database": map[string]any{"ok": false, "error": "shutting down"}},
+		})
+		return
+	}
 	if !s.ready.Load() {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
 			"status": "starting", "checks": map[string]any{"database": map[string]any{"ok": false, "error": "schema not yet applied"}},
@@ -116,9 +128,10 @@ func (s *Server) readyz(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	start := time.Now()
 	if err := db.Ping(ctx, s.pool); err != nil {
+		// The detail (host, user, database name) goes to the log, not to anonymous callers.
 		s.log.Warn("readiness check failed", "request_id", RequestID(r), "err", err)
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
-			"status": "unavailable", "checks": map[string]any{"database": map[string]any{"ok": false, "error": err.Error()}},
+			"status": "unavailable", "checks": map[string]any{"database": map[string]any{"ok": false, "error": "database unreachable"}},
 		})
 		return
 	}

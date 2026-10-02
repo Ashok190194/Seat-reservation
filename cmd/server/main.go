@@ -92,6 +92,8 @@ func main() {
 	}()
 
 	<-ctx.Done()
+	// Fail readiness first so the platform stops sending new requests, then drain.
+	srv.Drain()
 	log.Info("shutting down")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
