@@ -29,6 +29,7 @@ type Metrics struct {
 	ReservationsConfirmed prometheus.Counter
 	ReservationsHeld      prometheus.Counter
 	ReservationsDeclined  *prometheus.CounterVec
+	ReservationsReplayed  *prometheus.CounterVec
 	ReservationsCancelled prometheus.Counter
 	ReservationsExpired   prometheus.Counter
 	HoldsConfirmed        prometheus.Counter
@@ -52,6 +53,8 @@ func New(pool *pgxpool.Pool, showLimit int, log *slog.Logger) *Metrics {
 			Name: "reservations_held_total", Help: "Reservations created as time-boxed holds (shows with hold_ttl_seconds > 0)."}),
 		ReservationsDeclined: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "reservations_declined_total", Help: "Reserve requests that did not create a new reservation, by reason."}, []string{"reason"}),
+		ReservationsReplayed: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "reservations_replayed_total", Help: "Idempotent replays by the status of the stored original response (a replayed 201 is not a new sale)."}, []string{"original_status"}),
 		ReservationsCancelled: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "reservations_cancelled_total", Help: "Reservations cancelled by their owner."}),
 		ReservationsExpired: prometheus.NewCounter(prometheus.CounterOpts{
@@ -77,8 +80,11 @@ func New(pool *pgxpool.Pool, showLimit int, log *slog.Logger) *Metrics {
 	for _, r := range []string{ReasonSeatTaken, ReasonPerUserLimit, ReasonIdempotentReplay, ReasonIdempotentMismatch, ReasonUnknownSeat, ReasonShowNotFound, ReasonInvalidRequest} {
 		m.ReservationsDeclined.WithLabelValues(r)
 	}
+	for _, s := range []string{"201", "409"} {
+		m.ReservationsReplayed.WithLabelValues(s)
+	}
 	reg.MustRegister(
-		m.ReservationsConfirmed, m.ReservationsHeld, m.ReservationsDeclined, m.ReservationsCancelled,
+		m.ReservationsConfirmed, m.ReservationsHeld, m.ReservationsDeclined, m.ReservationsReplayed, m.ReservationsCancelled,
 		m.ReservationsExpired, m.HoldsConfirmed, m.IdempotencyKeysPurged, m.TxRetries,
 		m.HTTPRequests, m.HTTPDuration, m.HTTPInFlight, m.ReserveDuration,
 		collectors.NewGoCollector(),
@@ -102,6 +108,12 @@ var (
 	seatsTotalDesc = prometheus.NewDesc("seats_total", "Total seats per show.", []string{"show_id", "show_name"}, nil)
 	showsDesc      = prometheus.NewDesc("shows_total", "Number of shows in the system.", nil, nil)
 	scrapeErrDesc  = prometheus.NewDesc("seats_scrape_error", "1 if the last database scrape for seat gauges failed.", nil, nil)
+	// Database truth: unlike the in-process counters these survive restarts and
+	// agree across instances, so they reconcile with the API at any moment.
+	reservationsDesc = prometheus.NewDesc("reservations_by_status", "Reservations per show and status (live from the database).", []string{"show_id", "show_name", "status"}, nil)
+	mismatchDesc     = prometheus.NewDesc("seat_reservation_mismatches",
+		"Taken seats whose reservation disagrees (missing, other status or owner) plus live reservation seats that do not point back. "+
+			"Should be 0; it can be briefly non-zero between expiry-sweeper batches.", []string{"show_id", "show_name"}, nil)
 )
 
 func (c *seatCollector) Describe(ch chan<- *prometheus.Desc) {
@@ -110,6 +122,8 @@ func (c *seatCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- seatsTotalDesc
 	ch <- showsDesc
 	ch <- scrapeErrDesc
+	ch <- reservationsDesc
+	ch <- mismatchDesc
 }
 
 func (c *seatCollector) Collect(ch chan<- prometheus.Metric) {
@@ -137,21 +151,95 @@ func (c *seatCollector) Collect(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(scrapeErrDesc, prometheus.GaugeValue, 1)
 		return
 	}
-	defer rows.Close()
+	names := map[string]string{}
 	for rows.Next() {
 		var id, name string
 		var total, avail, held, conf int64
 		if err := rows.Scan(&id, &name, &total, &avail, &held, &conf); err != nil {
+			rows.Close()
 			ch <- prometheus.MustNewConstMetric(scrapeErrDesc, prometheus.GaugeValue, 1)
 			return
 		}
+		names[id] = name
 		ch <- prometheus.MustNewConstMetric(seatsDesc, prometheus.GaugeValue, float64(avail), id, name, "available")
 		ch <- prometheus.MustNewConstMetric(seatsDesc, prometheus.GaugeValue, float64(held), id, name, "held")
 		ch <- prometheus.MustNewConstMetric(seatsDesc, prometheus.GaugeValue, float64(conf), id, name, "confirmed")
 		ch <- prometheus.MustNewConstMetric(seatsAvailDesc, prometheus.GaugeValue, float64(avail), id, name)
 		ch <- prometheus.MustNewConstMetric(seatsTotalDesc, prometheus.GaugeValue, float64(total), id, name)
 	}
+	rows.Close()
+	if rows.Err() != nil || c.collectReservations(ctx, ch, names) != nil {
+		ch <- prometheus.MustNewConstMetric(scrapeErrDesc, prometheus.GaugeValue, 1)
+		return
+	}
 	ch <- prometheus.MustNewConstMetric(scrapeErrDesc, prometheus.GaugeValue, 0)
+}
+
+// collectReservations emits reservations_by_status and the cross-table mismatch
+// count for the shows the seat gauges cover.
+func (c *seatCollector) collectReservations(ctx context.Context, ch chan<- prometheus.Metric, names map[string]string) error {
+	byStatus := map[string]map[string]int64{}
+	rows, err := c.pool.Query(ctx, `
+		SELECT r.show_id::text, r.status, count(*)
+		FROM reservations r JOIN (SELECT id FROM shows ORDER BY created_at DESC LIMIT $1) s ON s.id = r.show_id
+		GROUP BY 1, 2`, c.limit)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var id, status string
+		var n int64
+		if err := rows.Scan(&id, &status, &n); err != nil {
+			rows.Close()
+			return err
+		}
+		if byStatus[id] == nil {
+			byStatus[id] = map[string]int64{}
+		}
+		byStatus[id][status] = n
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	mismatches := map[string]int64{}
+	rows, err = c.pool.Query(ctx, `
+		WITH recent AS (SELECT id FROM shows ORDER BY created_at DESC LIMIT $1)
+		SELECT st.show_id::text, count(*) FROM seats st
+		LEFT JOIN reservations r ON r.id = st.reservation_id
+		WHERE st.show_id IN (SELECT id FROM recent) AND st.status <> 'available'
+		  AND (r.id IS NULL OR r.status <> st.status OR r.user_id <> st.user_id OR r.show_id <> st.show_id)
+		GROUP BY 1
+		UNION ALL
+		SELECT r.show_id::text, count(*) FROM reservations r CROSS JOIN LATERAL unnest(r.seats) AS seat
+		LEFT JOIN seats st ON st.show_id = r.show_id AND st.label = seat AND st.reservation_id = r.id
+		WHERE r.show_id IN (SELECT id FROM recent) AND r.status IN ('held', 'confirmed') AND st.label IS NULL
+		GROUP BY 1`, c.limit)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var id string
+		var n int64
+		if err := rows.Scan(&id, &n); err != nil {
+			rows.Close()
+			return err
+		}
+		mismatches[id] += n
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	for id, name := range names {
+		for _, status := range []string{"held", "confirmed", "cancelled", "expired"} {
+			ch <- prometheus.MustNewConstMetric(reservationsDesc, prometheus.GaugeValue, float64(byStatus[id][status]), id, name, status)
+		}
+		ch <- prometheus.MustNewConstMetric(mismatchDesc, prometheus.GaugeValue, float64(mismatches[id]), id, name)
+	}
+	return nil
 }
 
 type poolCollector struct{ pool *pgxpool.Pool }

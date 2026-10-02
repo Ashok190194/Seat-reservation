@@ -39,7 +39,8 @@ func testServer(t *testing.T) (*httptest.Server, *atomic.Bool) {
 	}
 	t.Cleanup(pool.Close)
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	m := metrics.New(pool, 10, log)
+	// Gauges cover the newest 200 shows: parallel test packages create shows too.
+	m := metrics.New(pool, 200, log)
 	st := store.New(pool, log, nil)
 	var ready atomic.Bool
 	ready.Store(true)
@@ -306,6 +307,39 @@ func TestLogsEndpointServesRecentLinesByRequestID(t *testing.T) {
 	next := strconv.FormatFloat(r.body["next"].(float64), 'f', 0, 64)
 	if r := call(t, srv, "GET", "/logs?after="+next, "", "", nil); len(r.body["lines"].([]any)) != 0 {
 		t.Fatalf("tail after %s: %v", next, r.body)
+	}
+}
+
+func TestDatabaseGaugesAndReplayOutcomes(t *testing.T) {
+	srv, _ := testServer(t)
+	show := createShow(t, srv, `{"name":"dbtruth","seats":["A1","A2","A3"],"price_paise":100}`)
+	tok := token(t, srv, "dbtruth-"+show[:8])
+	hdr := map[string]string{"Idempotency-Key": "dbtruth-" + show}
+	first := call(t, srv, "POST", "/shows/"+show+"/reserve", tok, `{"seats":["A1"]}`, hdr)
+	if first.code != 201 {
+		t.Fatalf("reserve: %d %v", first.code, first.body)
+	}
+	other := call(t, srv, "POST", "/shows/"+show+"/reserve", tok, `{"seats":["A2"]}`, nil)
+	call(t, srv, "POST", "/reservations/"+other.body["reservation_id"].(string)+"/cancel", tok, "", nil)
+	replays := metric(t, srv, `reservations_replayed_total{original_status="201"}`)
+	if r := call(t, srv, "POST", "/shows/"+show+"/reserve", tok, `{"seats":["A1"]}`, hdr); r.hdr.Get("Idempotent-Replayed") != "true" {
+		t.Fatalf("expected a replay: %d", r.code)
+	}
+	if d := metric(t, srv, `reservations_replayed_total{original_status="201"}`) - replays; d != 1 {
+		t.Errorf("replayed 201s moved by %v, want 1", d)
+	}
+	labels := `{show_id="` + show + `",show_name="dbtruth"`
+	if v := metric(t, srv, "reservations_by_status"+labels+`,status="confirmed"}`); v != 1 {
+		t.Errorf("confirmed reservations gauge = %v, want 1", v)
+	}
+	if v := metric(t, srv, "reservations_by_status"+labels+`,status="cancelled"}`); v != 1 {
+		t.Errorf("cancelled reservations gauge = %v, want 1", v)
+	}
+	if v := metric(t, srv, "seat_reservation_mismatches"+labels+"}"); v != 0 {
+		t.Errorf("mismatches = %v, want 0", v)
+	}
+	if v := metric(t, srv, "seats_scrape_error"); v != 0 {
+		t.Errorf("seats_scrape_error = %v", v)
 	}
 }
 

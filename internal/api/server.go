@@ -414,6 +414,7 @@ func (s *Server) reserve(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case out.Replayed:
 		s.metrics.ReservationsDeclined.WithLabelValues(metrics.ReasonIdempotentReplay).Inc()
+		s.metrics.ReservationsReplayed.WithLabelValues(strconv.Itoa(out.ReplayStatus)).Inc()
 		annotate(r, "", "idempotent_replay")
 		w.Header().Set("Idempotent-Replayed", "true")
 		writeRaw(w, out.ReplayStatus, out.ReplayBody)
