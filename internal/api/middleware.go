@@ -135,6 +135,10 @@ func (s *Server) observe(next http.Handler) http.Handler {
 			if route == "GET /metrics" || route == "GET /healthz" || route == "GET /readyz" || route == "GET /logs" {
 				level = slog.LevelDebug
 			}
+			// The dashboard's once-a-second polling marks itself; failures still log loudly.
+			if r.Method == http.MethodGet && r.Header.Get("X-Dashboard") != "" && sw.status < 500 {
+				level = slog.LevelDebug
+			}
 			s.log.Log(r.Context(), level, "request", attrs...)
 		}()
 

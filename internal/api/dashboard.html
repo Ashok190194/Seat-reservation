@@ -15,19 +15,22 @@
   select, input, button { background:var(--panel); color:var(--text); border:1px solid var(--line); border-radius:6px; padding:6px 10px; font:inherit }
   button { cursor:pointer } button:hover { border-color:#3b4a66 }
   main { padding:20px; display:grid; gap:16px; grid-template-columns: 1fr; max-width:1400px; margin:0 auto }
-  @media (min-width: 980px) { main { grid-template-columns: 2fr 1fr } }
-  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px }
+  @media (min-width: 980px) { main { grid-template-columns: 2fr 1fr } .wide { grid-column: 1 / -1 } }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px; min-width:0 }
   .panel h2 { margin:0 0 12px; font-size:13px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); font-weight:600 }
   .stats { display:grid; grid-template-columns: repeat(auto-fit,minmax(120px,1fr)); gap:10px }
   .stat { background:#0f1521; border:1px solid var(--line); border-radius:8px; padding:10px 12px }
   .stat .k { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.05em }
-  .stat .v { font-size:22px; font-weight:600; font-variant-numeric: tabular-nums }
+  .stat .v { font-size:22px; font-weight:600 }
   .stat.avail .v { color:#79b8ff } .stat.held .v { color:#e3b341 } .stat.conf .v { color:#56d364 }
-  .invariant { margin-top:12px; padding:10px 12px; border-radius:8px; font-weight:600; font-variant-numeric: tabular-nums }
+  .invariant { margin-top:10px; padding:10px 12px; border-radius:8px; font-weight:600; font-variant-numeric: tabular-nums }
   .invariant.ok { background:rgba(46,160,67,.15); color:#56d364; border:1px solid rgba(46,160,67,.4) }
   .invariant.bad { background:rgba(248,81,73,.15); color:var(--bad); border:1px solid rgba(248,81,73,.4) }
-  .grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(34px, 1fr)); gap:4px; margin-top:12px; max-height:60vh; overflow:auto }
-  .seat { aspect-ratio:1; border-radius:4px; display:flex; align-items:center; justify-content:center; font-size:9px; color:#fff; opacity:.95; font-variant-numeric: tabular-nums; overflow:hidden; white-space:nowrap }
+  .invariant.wait { background:#0f1521; color:var(--muted); border:1px solid var(--line) }
+  .truth { margin-top:10px; color:var(--muted); font-size:12.5px; font-variant-numeric: tabular-nums }
+  .truth b { color:var(--text); font-weight:600 }
+  .grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(34px, 1fr)); gap:4px; margin-top:12px; max-height:52vh; overflow:auto }
+  .seat { aspect-ratio:1; border-radius:4px; display:flex; align-items:center; justify-content:center; font-size:9px; color:#fff; opacity:.95; overflow:hidden; white-space:nowrap }
   .seat.available { background:var(--avail) } .seat.held { background:var(--held); color:#111 } .seat.confirmed { background:var(--conf) }
   table { width:100%; border-collapse:collapse; font-variant-numeric: tabular-nums }
   td { padding:6px 4px; border-bottom:1px solid var(--line) } td:last-child { text-align:right; font-weight:600 }
@@ -35,6 +38,12 @@
   .legend span { display:inline-flex; align-items:center; gap:6px; margin-right:12px; color:var(--muted); font-size:12px }
   .legend i { width:12px; height:12px; border-radius:3px; display:inline-block }
   code { background:#0f1521; padding:2px 5px; border-radius:4px; font-size:12px }
+  .logbar { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:10px }
+  .logbar input { flex:1 1 260px; min-width:0 }
+  .logs { font:12px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace; max-height:340px; overflow:auto; background:#0f1521; border:1px solid var(--line); border-radius:8px; padding:8px 10px }
+  .logs div { white-space:nowrap }
+  .logs .s2 { color:#56d364 } .logs .s4 { color:#e3b341 } .logs .s5 { color:var(--bad) } .logs .t { color:var(--muted) }
+  .logs a { color:#79b8ff; text-decoration:none; cursor:pointer }
 </style>
 </head>
 <body>
@@ -54,7 +63,9 @@
       <div class="stat held"><div class="k">Held</div><div class="v" id="held">–</div></div>
       <div class="stat conf"><div class="k">Confirmed</div><div class="v" id="conf">–</div></div>
     </div>
-    <div id="invariant" class="invariant ok">available + held + confirmed == total_seats</div>
+    <div id="invariant" class="invariant wait">available + held + confirmed == total_seats</div>
+    <div id="crosscheck" class="invariant wait">seats ↔ reservations: waiting for the first scrape…</div>
+    <div class="truth" id="truth">Reservations in the database: –</div>
     <div class="legend" style="margin-top:12px">
       <span><i style="background:var(--avail)"></i>available</span>
       <span><i style="background:var(--held)"></i>held</span>
@@ -65,21 +76,32 @@
   <aside class="panel">
     <h2>Prometheus counters (<code>/metrics</code>)</h2>
     <table id="metrics"><tr><td class="muted">waiting for first scrape…</td><td></td></tr></table>
-    <p class="muted" style="margin-top:14px;font-size:12px">
-      Polling <code>GET /shows/{id}</code> and <code>GET /metrics</code> every second.
-      Counters are process-wide; seat gauges are read live from the database on every scrape.
+    <p class="muted" style="margin-top:14px;font-size:12px" id="since">
+      Counters count events since this process started and reset on every restart or deploy.
+      The seat and reservation figures on the left are read from the database and never reset.
     </p>
   </aside>
+  <section class="panel wide">
+    <h2>Live log (<code>/logs</code>, this instance)</h2>
+    <div class="logbar">
+      <input id="logFilter" placeholder="filter: a request id, a user id, seat_taken, 409…">
+      <button id="logClear">Clear filter</button>
+      <span class="sub muted" id="logStatus"></span>
+    </div>
+    <div class="logs" id="logs"><div class="t">waiting for log lines…</div></div>
+  </section>
 </main>
 <script>
 (() => {
   const $ = id => document.getElementById(id);
   let showId = new URLSearchParams(location.search).get('show') || '';
   const fmt = n => n.toLocaleString();
+  // Polling requests say so, and the server logs them at debug level so they do not fill the live log.
+  const get = url => fetch(url, { headers: { 'X-Dashboard': '1' } });
 
   async function loadShows() {
     try {
-      const r = await fetch('/shows'); const j = await r.json();
+      const j = await (await get('/shows')).json();
       const sel = $('showSelect'); sel.innerHTML = '';
       if (!j.shows.length) { sel.innerHTML = '<option value="">No shows yet — POST /shows to create one</option>'; return; }
       for (const s of j.shows) {
@@ -112,7 +134,7 @@
   async function pollShow() {
     if (!showId) return;
     try {
-      const r = await fetch('/shows/' + encodeURIComponent(showId));
+      const r = await get('/shows/' + encodeURIComponent(showId));
       if (!r.ok) { $('status').textContent = `GET /shows/${showId} → ${r.status}`; return; }
       render(await r.json());
       $('status').textContent = 'updated ' + new Date().toLocaleTimeString();
@@ -125,6 +147,7 @@
     ['reservations_declined_total{reason="seat_taken"}', 'Declined · seat taken'],
     ['reservations_declined_total{reason="per_user_limit"}', 'Declined · per-user limit'],
     ['reservations_declined_total{reason="idempotent_replay"}', 'Idempotent replays'],
+    ['reservations_replayed_total{original_status="201"}', '  of which replayed 201s'],
     ['reservations_declined_total{reason="idempotency_key_reused"}', 'Declined · key reused w/ different body'],
     ['reservations_declined_total{reason="unknown_seat"}', 'Declined · unknown seat'],
     ['reservations_cancelled_total', 'Cancelled'],
@@ -133,9 +156,15 @@
     ['http_requests_in_flight', 'HTTP in flight'],
     ['db_pool_connections_total', 'DB connections open'],
   ];
+  // Pull the value of a labelled series for the watched show out of the exposition text.
+  const showSeries = (vals, name, extra) => {
+    const pre = `${name}{show_id="${showId}",`;
+    for (const k in vals) if (k.startsWith(pre) && (!extra || k.includes(extra))) return vals[k];
+    return undefined;
+  };
   async function pollMetrics() {
     try {
-      const t = await (await fetch('/metrics')).text();
+      const t = await (await get('/metrics')).text();
       const vals = {}; let fivexx = 0;
       for (const line of t.split('\n')) {
         if (!line || line[0] === '#') continue;
@@ -146,14 +175,75 @@
       const rows = wanted.map(([k, label]) => `<tr><td>${label}</td><td>${k in vals ? fmt(vals[k]) : '<span class="muted">0</span>'}</td></tr>`);
       rows.push(`<tr><td>HTTP 5xx responses</td><td class="${fivexx ? 'err' : ''}">${fmt(fivexx)}</td></tr>`);
       $('metrics').innerHTML = rows.join('');
+      const started = vals['process_start_time_seconds'];
+      if (started) {
+        const mins = Math.max(0, Math.round((Date.now() / 1000 - started) / 60));
+        $('since').textContent = `Counters count events since this process started at ${new Date(started * 1000).toLocaleTimeString()} (${mins} min ago) and reset on every restart or deploy. The seat and reservation figures on the left are read from the database and never reset.`;
+      }
+      if (showId) {
+        const mm = showSeries(vals, 'seat_reservation_mismatches');
+        const cc = $('crosscheck');
+        if (mm === undefined) { cc.className = 'invariant wait'; cc.textContent = 'seats ↔ reservations: not reported for this show (only the newest shows are scraped)'; }
+        else { cc.className = 'invariant ' + (mm === 0 ? 'ok' : 'bad'); cc.textContent = mm === 0 ? 'seats ↔ reservations: every taken seat matches its reservation ✓' : `seats ↔ reservations: ${mm} mismatches ✗`; }
+        const st = s => showSeries(vals, 'reservations_by_status', `status="${s}"`);
+        if (st('confirmed') !== undefined) {
+          $('truth').innerHTML = `Reservations in the database: <b>${fmt(st('confirmed'))}</b> confirmed · <b>${fmt(st('held'))}</b> held · <b>${fmt(st('cancelled'))}</b> cancelled · <b>${fmt(st('expired'))}</b> expired`;
+        }
+      }
     } catch (e) { /* keep last values */ }
   }
 
-  $('go').onclick = () => { showId = $('showInput').value.trim() || $('showSelect').value; history.replaceState(null, '', '?show=' + showId); $('grid').innerHTML = ''; pollShow(); };
-  $('showSelect').onchange = () => { showId = $('showSelect').value; history.replaceState(null, '', '?show=' + showId); $('grid').innerHTML = ''; pollShow(); };
+  // Live log tail: GET /logs?after=<next> returns only lines written since the last poll.
+  let logNext = 0; const logLines = [];
+  function renderLogs() {
+    const f = $('logFilter').value.trim();
+    const box = $('logs'); const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 4;
+    box.textContent = '';
+    const shown = logLines.filter(l => !f || l.raw.includes(f)).slice(-200);
+    if (!shown.length) { const d = document.createElement('div'); d.className = 't'; d.textContent = f ? 'no lines match the filter' : 'waiting for log lines…'; box.appendChild(d); }
+    for (const l of shown) {
+      const d = document.createElement('div');
+      const j = l.obj, t = document.createElement('span'); t.className = 't';
+      t.textContent = (j.time || '').slice(11, 23) + ' ';
+      d.appendChild(t);
+      const main = document.createElement('span');
+      if (j.msg === 'request') {
+        main.className = 's' + String(j.status || '')[0];
+        main.textContent = `${j.status} ${j.method} ${j.path} ${j.duration_ms}ms` + (j.outcome ? ` ${j.outcome}` : '') + (j.user_id ? ` user=${j.user_id}` : '') + ' ';
+      } else {
+        main.textContent = `${j.level} ${j.msg}` + (j.reservation_id ? ` reservation=${j.reservation_id}` : '') + (j.seats ? ` seats=${j.seats}` : '') + ' ';
+      }
+      d.appendChild(main);
+      if (j.request_id) {
+        const a = document.createElement('a'); a.textContent = j.request_id.slice(0, 8); a.title = 'filter by request id ' + j.request_id;
+        a.onclick = () => { $('logFilter').value = j.request_id; renderLogs(); };
+        d.appendChild(a);
+      }
+      box.appendChild(d);
+    }
+    if (atBottom) box.scrollTop = box.scrollHeight;
+  }
+  async function pollLogs() {
+    try {
+      const r = await get('/logs?limit=500&after=' + logNext);
+      if (!r.ok) { $('logStatus').textContent = `GET /logs → ${r.status}`; return; }
+      const j = await r.json();
+      if (j.next < logNext) logLines.length = 0; // the process restarted; its buffer starts over
+      logNext = j.next;
+      for (const obj of j.lines) logLines.push({ obj, raw: JSON.stringify(obj) });
+      if (logLines.length > 2000) logLines.splice(0, logLines.length - 2000);
+      $('logStatus').textContent = `${logLines.length} lines`;
+      renderLogs();
+    } catch (e) { $('logStatus').textContent = 'log fetch failed'; }
+  }
+  $('logFilter').oninput = renderLogs;
+  $('logClear').onclick = () => { $('logFilter').value = ''; renderLogs(); };
 
-  loadShows().then(pollShow); pollMetrics();
-  setInterval(pollShow, 1000); setInterval(pollMetrics, 1000); setInterval(loadShows, 10000);
+  $('go').onclick = () => { showId = $('showInput').value.trim() || $('showSelect').value; history.replaceState(null, '', '?show=' + showId); $('grid').innerHTML = ''; pollShow(); pollMetrics(); };
+  $('showSelect').onchange = () => { showId = $('showSelect').value; history.replaceState(null, '', '?show=' + showId); $('grid').innerHTML = ''; pollShow(); pollMetrics(); };
+
+  loadShows().then(() => { pollShow(); pollMetrics(); }); pollLogs();
+  setInterval(pollShow, 1000); setInterval(pollMetrics, 1000); setInterval(pollLogs, 2000); setInterval(loadShows, 10000);
 })();
 </script>
 </body>
