@@ -16,8 +16,11 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
@@ -180,8 +183,8 @@ func (s *Server) createShow(w http.ResponseWriter, r *http.Request) {
 	}
 	body.Name = strings.TrimSpace(body.Name)
 	switch {
-	case body.Name == "" || len(body.Name) > 200:
-		writeError(w, http.StatusBadRequest, "invalid_request", "name is required (1-200 chars)")
+	case body.Name == "" || len(body.Name) > 200 || !printableText(body.Name):
+		writeError(w, http.StatusBadRequest, "invalid_request", "name is required (1-200 bytes of printable text)")
 		return
 	case body.PricePaise == nil || *body.PricePaise < 0:
 		writeError(w, http.StatusBadRequest, "invalid_request", "price_paise is required and must be a non-negative integer")
@@ -194,8 +197,8 @@ func (s *Server) createShow(w http.ResponseWriter, r *http.Request) {
 	seats := make([]string, 0, len(body.Seats))
 	for _, raw := range body.Seats {
 		label := strings.TrimSpace(raw)
-		if label == "" || len(label) > maxSeatLabelLen {
-			writeError(w, http.StatusBadRequest, "invalid_request", "seat labels must be 1-32 non-blank characters")
+		if label == "" || len(label) > maxSeatLabelLen || !printableText(label) {
+			writeError(w, http.StatusBadRequest, "invalid_request", "seat labels must be 1-32 bytes of printable text")
 			return
 		}
 		if _, dup := seen[label]; dup {
@@ -268,7 +271,7 @@ func (s *Server) reserve(w http.ResponseWriter, r *http.Request) {
 	}
 	var body struct {
 		Seats          []string `json:"seats"`
-		IdempotencyKey string   `json:"idempotency_key"`
+		IdempotencyKey *string  `json:"idempotency_key"`
 		// user_id is deliberately not read: identity is the token's, full stop.
 	}
 	if !decodeBody(w, r, &body) {
@@ -276,7 +279,15 @@ func (s *Server) reserve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	headerKey := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
-	bodyKey := strings.TrimSpace(body.IdempotencyKey)
+	bodyKey := ""
+	if body.IdempotencyKey != nil {
+		bodyKey = strings.TrimSpace(*body.IdempotencyKey)
+	}
+	// A key that is sent but blank would otherwise silently turn idempotency off.
+	if (len(r.Header.Values("Idempotency-Key")) > 0 && headerKey == "") || (body.IdempotencyKey != nil && bodyKey == "") {
+		s.declineInvalid(w, r, "idempotency key is blank; send a non-empty key or leave it out")
+		return
+	}
 	key := headerKey
 	if key == "" {
 		key = bodyKey
@@ -285,8 +296,8 @@ func (s *Server) reserve(w http.ResponseWriter, r *http.Request) {
 		s.declineInvalid(w, r, "Idempotency-Key header and idempotency_key body field disagree")
 		return
 	}
-	if len(key) > maxIdemKeyLen {
-		s.declineInvalid(w, r, "idempotency key must be at most 128 characters")
+	if len(key) > maxIdemKeyLen || !printableASCII(key) {
+		s.declineInvalid(w, r, "idempotency key must be at most 128 printable ASCII characters")
 		return
 	}
 	if len(body.Seats) == 0 {
@@ -300,8 +311,8 @@ func (s *Server) reserve(w http.ResponseWriter, r *http.Request) {
 	seatSet := make(map[string]struct{}, len(body.Seats))
 	for _, raw := range body.Seats {
 		label := strings.TrimSpace(raw)
-		if label == "" || len(label) > maxSeatLabelLen {
-			s.declineInvalid(w, r, "seat labels must be 1-32 non-blank characters")
+		if label == "" || len(label) > maxSeatLabelLen || !printableText(label) {
+			s.declineInvalid(w, r, "seat labels must be 1-32 bytes of printable text")
 			return
 		}
 		seatSet[label] = struct{}{}
@@ -491,6 +502,15 @@ func (s *Server) serverError(w http.ResponseWriter, r *http.Request, op string, 
 		writeError(w, 499, "client_closed_request", "client closed the request")
 		return
 	}
+	// SQLSTATE class 22 (data exception: bad encoding, out-of-range value) means
+	// the input could not be stored. That is the caller's problem, never a 5xx.
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && strings.HasPrefix(pgErr.Code, "22") {
+		s.log.Warn(op+" rejected input", "request_id", RequestID(r), "sqlstate", pgErr.Code, "err", pgErr.Message)
+		annotate(r, "", "invalid_request")
+		writeError(w, http.StatusBadRequest, "invalid_request", "a value in the request cannot be stored")
+		return
+	}
 	s.log.Error(op+" failed", "request_id", RequestID(r), "err", err)
 	annotate(r, "", "server_error")
 	writeError(w, http.StatusServiceUnavailable, "unavailable", "the service could not complete the request; retry with the same idempotency key")
@@ -523,6 +543,29 @@ func canonicalID(raw string) (string, bool) {
 		return "", false
 	}
 	return u.String(), true
+}
+
+// printableText reports whether s is valid UTF-8 without control characters.
+// Postgres TEXT rejects NUL and invalid UTF-8, which would otherwise surface as a 5xx.
+func printableText(s string) bool {
+	if !utf8.ValidString(s) {
+		return false
+	}
+	for _, r := range s {
+		if unicode.IsControl(r) {
+			return false
+		}
+	}
+	return true
+}
+
+func printableASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x20 || s[i] > 0x7e {
+			return false
+		}
+	}
+	return true
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

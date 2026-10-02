@@ -280,3 +280,28 @@ func TestPerUserLimitHoldsAcrossIDSpellingsOverHTTP(t *testing.T) {
 		t.Fatalf("user won %d seats on a limit-4 show", won.Load())
 	}
 }
+
+func TestUnstorableInputIsAClientError(t *testing.T) {
+	srv, _ := testServer(t)
+	show := createShow(t, srv, `{"name":"bytes","seats":["A1","A2"],"price_paise":100}`)
+	tok := token(t, srv, "bytes-"+show[:8])
+	path := "/shows/" + show + "/reserve"
+	cases := []struct {
+		name, body string
+		hdr        map[string]string
+	}{
+		{"NUL in body key", `{"seats":["A1"],"idempotency_key":"k\u0000x"}`, nil},
+		{"invalid UTF-8 in header key", `{"seats":["A1"]}`, map[string]string{"Idempotency-Key": "k\xff"}},
+		{"NUL in seat label", `{"seats":["A\u0000"]}`, nil},
+		{"blank header key", `{"seats":["A1"]}`, map[string]string{"Idempotency-Key": "   "}},
+		{"blank body key", `{"seats":["A1"],"idempotency_key":"  "}`, nil},
+	}
+	for _, c := range cases {
+		if r := call(t, srv, "POST", path, tok, c.body, c.hdr); r.code != 400 || errCode(r) != "invalid_request" {
+			t.Errorf("%s: got %d %q, want 400 invalid_request", c.name, r.code, errCode(r))
+		}
+	}
+	if r := call(t, srv, "POST", "/shows", adminToken, `{"name":"bad\u0000name","seats":["A1"],"price_paise":1}`, nil); r.code != 400 {
+		t.Errorf("NUL in show name: %d", r.code)
+	}
+}
