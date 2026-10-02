@@ -16,6 +16,7 @@ import (
 
 	"github.com/seatreserve/seatreserve/internal/auth"
 	"github.com/seatreserve/seatreserve/internal/db"
+	"github.com/seatreserve/seatreserve/internal/logbuf"
 	"github.com/seatreserve/seatreserve/internal/metrics"
 	"github.com/seatreserve/seatreserve/internal/store"
 )
@@ -221,6 +222,46 @@ func TestReadinessFailsClosedBeforeBootstrap(t *testing.T) {
 	}
 	if r := call(t, srv, "GET", "/healthz", "", "", nil); r.code != 200 {
 		t.Fatalf("liveness must stay up: %d", r.code)
+	}
+}
+
+func TestLogsEndpointServesRecentLinesByRequestID(t *testing.T) {
+	url := os.Getenv("DATABASE_URL")
+	if url == "" {
+		t.Skip("DATABASE_URL not set; skipping integration test")
+	}
+	ctx := context.Background()
+	pool, err := db.Connect(ctx, url, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	ring := logbuf.New(100)
+	log := slog.New(slog.NewJSONHandler(ring, nil))
+	var ready atomic.Bool
+	ready.Store(true)
+	s := New(store.New(pool, log, nil), auth.New("test-secret", adminToken), metrics.New(pool, 10, log), pool, log, &ready)
+	s.SetLogBuffer(ring)
+	srv := httptest.NewServer(s.Handler())
+	t.Cleanup(srv.Close)
+
+	call(t, srv, "GET", "/shows/not-a-show", "", "", map[string]string{"X-Request-ID": "trace-logs-1"})
+	r := call(t, srv, "GET", "/logs?request_id=trace-logs-1", "", "", nil)
+	lines, _ := r.body["lines"].([]any)
+	if r.code != 200 || len(lines) != 1 {
+		t.Fatalf("logs: %d %v", r.code, r.body)
+	}
+	line := lines[0].(map[string]any)
+	if line["route"] != "GET /shows/{id}" || line["status"] != float64(404) {
+		t.Fatalf("unexpected log line %v", line)
+	}
+	// Tailing: nothing new since the returned position, and reading the log is not itself logged.
+	next := strconv.FormatFloat(r.body["next"].(float64), 'f', 0, 64)
+	if r := call(t, srv, "GET", "/logs?after="+next, "", "", nil); len(r.body["lines"].([]any)) != 0 {
+		t.Fatalf("tail after %s: %v", next, r.body)
 	}
 }
 

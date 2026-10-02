@@ -3,6 +3,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	_ "embed"
@@ -14,6 +15,7 @@ import (
 	"log/slog"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -27,6 +29,7 @@ import (
 
 	"github.com/seatreserve/seatreserve/internal/auth"
 	"github.com/seatreserve/seatreserve/internal/db"
+	"github.com/seatreserve/seatreserve/internal/logbuf"
 	"github.com/seatreserve/seatreserve/internal/metrics"
 	"github.com/seatreserve/seatreserve/internal/store"
 )
@@ -57,11 +60,16 @@ type Server struct {
 	// ready flips to true once the schema has been applied; until then
 	// /readyz reports 503 even if the database answers pings.
 	ready *atomic.Bool
+	// logs holds this instance's recent log lines for GET /logs (nil disables it).
+	logs *logbuf.Ring
 }
 
 func New(st *store.Store, a *auth.Authenticator, m *metrics.Metrics, pool *pgxpool.Pool, log *slog.Logger, ready *atomic.Bool) *Server {
 	return &Server{store: st, auth: a, metrics: m, pool: pool, log: log, ready: ready}
 }
+
+// SetLogBuffer enables GET /logs, served from the ring the logger also writes to.
+func (s *Server) SetLogBuffer(r *logbuf.Ring) { s.logs = r }
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
@@ -70,6 +78,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", s.healthz)
 	mux.HandleFunc("GET /readyz", s.readyz)
 	mux.Handle("GET /metrics", promhttp.HandlerFor(s.metrics.Registry, promhttp.HandlerOpts{}))
+	mux.HandleFunc("GET /logs", s.recentLogs)
 
 	mux.HandleFunc("POST /auth/token", s.issueToken)
 	mux.HandleFunc("POST /shows", s.createShow)
@@ -116,6 +125,43 @@ func (s *Server) readyz(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status": "ready", "checks": map[string]any{"database": map[string]any{"ok": true, "latency_ms": float64(time.Since(start).Microseconds()) / 1000}},
 	})
+}
+
+// recentLogs serves this instance's most recent JSON log lines, oldest first.
+// Filters: ?request_id= (exact), ?q= (substring). ?after=<next from the previous
+// response> returns only lines written since, so a client can tail the log.
+// The buffer is per instance and starts empty on every restart.
+func (s *Server) recentLogs(w http.ResponseWriter, r *http.Request) {
+	if s.logs == nil {
+		writeError(w, http.StatusNotFound, "not_found", "the log buffer is not enabled")
+		return
+	}
+	q := r.URL.Query()
+	limit := 200
+	if v, err := strconv.Atoi(q.Get("limit")); err == nil && v > 0 {
+		limit = min(v, 2000)
+	}
+	after, _ := strconv.ParseUint(q.Get("after"), 10, 64)
+	var needles [][]byte
+	if id := strings.TrimSpace(q.Get("request_id")); id != "" {
+		needles = append(needles, []byte(`"request_id":"`+id+`"`))
+	}
+	if text := q.Get("q"); text != "" {
+		needles = append(needles, []byte(text))
+	}
+	lines, next := s.logs.Since(after, limit, func(line []byte) bool {
+		for _, n := range needles {
+			if !bytes.Contains(line, n) {
+				return false
+			}
+		}
+		return true
+	})
+	raw := make([]json.RawMessage, len(lines))
+	for i, l := range lines {
+		raw[i] = l
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"next": next, "lines": raw})
 }
 
 func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {

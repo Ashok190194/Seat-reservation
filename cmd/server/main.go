@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -19,6 +20,7 @@ import (
 	"github.com/seatreserve/seatreserve/internal/auth"
 	"github.com/seatreserve/seatreserve/internal/config"
 	"github.com/seatreserve/seatreserve/internal/db"
+	"github.com/seatreserve/seatreserve/internal/logbuf"
 	"github.com/seatreserve/seatreserve/internal/metrics"
 	"github.com/seatreserve/seatreserve/internal/store"
 )
@@ -33,7 +35,10 @@ func main() {
 	if err := level.UnmarshalText([]byte(cfg.LogLevel)); err != nil {
 		level = slog.LevelInfo
 	}
-	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
+	// Every line goes to stdout (the platform's log viewer) and to an in-memory
+	// ring that GET /logs serves publicly.
+	logRing := logbuf.New(2000)
+	log := slog.New(slog.NewJSONHandler(io.MultiWriter(os.Stdout, logRing), &slog.HandlerOptions{Level: level}))
 	slog.SetDefault(log)
 	for _, d := range cfg.UsingDefaults {
 		log.Warn("using insecure default; set the environment variable in production", "var", d)
@@ -55,6 +60,7 @@ func main() {
 	a := auth.New(cfg.TokenSecret, cfg.AdminToken)
 	var ready atomic.Bool
 	srv := api.New(st, a, m, pool, log, &ready)
+	srv.SetLogBuffer(logRing)
 
 	// Liveness is served immediately; readiness stays 503 until the database is
 	// reachable and the schema is applied. Managed Postgres often comes up a few

@@ -130,7 +130,9 @@ func (s *Server) observe(next http.Handler) http.Handler {
 			if sw.status >= 500 {
 				level = slog.LevelError
 			}
-			if route == "GET /metrics" || route == "GET /healthz" || route == "GET /readyz" {
+			// Probes, scrapes and log reads would otherwise drown the request log
+			// (and GET /logs would fill its own buffer).
+			if route == "GET /metrics" || route == "GET /healthz" || route == "GET /readyz" || route == "GET /logs" {
 				level = slog.LevelDebug
 			}
 			s.log.Log(r.Context(), level, "request", attrs...)
