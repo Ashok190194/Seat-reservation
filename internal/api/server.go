@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
@@ -240,7 +241,12 @@ func (s *Server) listShows(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) getShow(w http.ResponseWriter, r *http.Request) {
-	st, err := s.store.GetShow(r.Context(), r.PathValue("id"))
+	id, ok := canonicalID(r.PathValue("id"))
+	if !ok {
+		writeError(w, http.StatusNotFound, "show_not_found", "show does not exist")
+		return
+	}
+	st, err := s.store.GetShow(r.Context(), id)
 	if errors.Is(err, store.ErrNotFound) {
 		writeError(w, http.StatusNotFound, "show_not_found", "show does not exist")
 		return
@@ -306,7 +312,16 @@ func (s *Server) reserve(w http.ResponseWriter, r *http.Request) {
 	}
 	sort.Strings(seats)
 
-	showID := r.PathValue("id")
+	// One spelling per show: the advisory lock key, the request hash and the
+	// response all use the canonical id, so /shows/ABC… and /shows/abc… are
+	// the same show for the per-user limit and for idempotency.
+	showID, ok := canonicalID(r.PathValue("id"))
+	if !ok {
+		s.metrics.ReservationsDeclined.WithLabelValues(metrics.ReasonShowNotFound).Inc()
+		annotate(r, "", metrics.ReasonShowNotFound)
+		writeError(w, http.StatusNotFound, "show_not_found", "show does not exist")
+		return
+	}
 	in := store.ReserveInput{ShowID: showID, UserID: user, Seats: seats, IdempotencyKey: key}
 	if key != "" {
 		in.RequestHash = requestHash(showID, seats)
@@ -370,7 +385,16 @@ func (s *Server) myReservations(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	list, err := s.store.ListUserReservations(r.Context(), user, strings.TrimSpace(r.URL.Query().Get("show_id")), 100)
+	showID := strings.TrimSpace(r.URL.Query().Get("show_id"))
+	if showID != "" {
+		id, ok := canonicalID(showID)
+		if !ok {
+			writeJSON(w, http.StatusOK, map[string]any{"user_id": user, "reservations": []store.Reservation{}})
+			return
+		}
+		showID = id
+	}
+	list, err := s.store.ListUserReservations(r.Context(), user, showID, 100)
 	if err != nil {
 		s.serverError(w, r, "list reservations", err)
 		return
@@ -378,15 +402,26 @@ func (s *Server) myReservations(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"user_id": user, "reservations": list})
 }
 
+// reservationID returns the canonical reservation id from the path, or writes a 404.
+func reservationID(w http.ResponseWriter, r *http.Request) (string, bool) {
+	id, ok := canonicalID(r.PathValue("id"))
+	if !ok {
+		writeError(w, http.StatusNotFound, "reservation_not_found", "reservation does not exist")
+	}
+	return id, ok
+}
+
 func (s *Server) getReservation(w http.ResponseWriter, r *http.Request) {
 	user, ok := s.requireUser(w, r)
 	if !ok {
 		return
 	}
-	res, err := s.store.GetReservation(r.Context(), r.PathValue("id"), user)
-	if !s.writeReservationResult(w, r, res, err) {
+	id, ok := reservationID(w, r)
+	if !ok {
 		return
 	}
+	res, err := s.store.GetReservation(r.Context(), id, user)
+	s.writeReservationResult(w, r, res, err)
 }
 
 func (s *Server) cancel(w http.ResponseWriter, r *http.Request) {
@@ -394,7 +429,11 @@ func (s *Server) cancel(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	res, err := s.store.Cancel(r.Context(), r.PathValue("id"), user)
+	id, ok := reservationID(w, r)
+	if !ok {
+		return
+	}
+	res, err := s.store.Cancel(r.Context(), id, user)
 	if s.writeReservationResult(w, r, res, err) && res.Status == store.StatusCancelled {
 		s.metrics.ReservationsCancelled.Inc()
 		annotate(r, "", "cancelled")
@@ -407,7 +446,11 @@ func (s *Server) confirm(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	res, err := s.store.Confirm(r.Context(), r.PathValue("id"), user)
+	id, ok := reservationID(w, r)
+	if !ok {
+		return
+	}
+	res, err := s.store.Confirm(r.Context(), id, user)
 	if s.writeReservationResult(w, r, res, err) && res.Status == store.StatusConfirmed {
 		s.metrics.HoldsConfirmed.Inc()
 		s.metrics.ReservationsConfirmed.Inc()
@@ -465,6 +508,21 @@ func decodeBody(w http.ResponseWriter, r *http.Request, dst any) bool {
 		return false
 	}
 	return true
+}
+
+// canonicalID accepts only the 36-character hyphenated UUID form, in any case,
+// and returns it lower-cased. uuid.Parse alone also accepts urn:uuid:, braced
+// and unhyphenated spellings; those would give one show several advisory-lock
+// keys, and Postgres rejects some of them outright.
+func canonicalID(raw string) (string, bool) {
+	if len(raw) != 36 {
+		return "", false
+	}
+	u, err := uuid.Parse(raw)
+	if err != nil {
+		return "", false
+	}
+	return u.String(), true
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

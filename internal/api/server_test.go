@@ -7,7 +7,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -218,5 +220,63 @@ func TestReadinessFailsClosedBeforeBootstrap(t *testing.T) {
 	}
 	if r := call(t, srv, "GET", "/healthz", "", "", nil); r.code != 200 {
 		t.Fatalf("liveness must stay up: %d", r.code)
+	}
+}
+
+func TestShowIDSpellingsAreOneShow(t *testing.T) {
+	srv, _ := testServer(t)
+	show := createShow(t, srv, `{"name":"spell","seats":["A1","A2","A3"],"price_paise":100}`)
+	tok := token(t, srv, "spell-"+show[:8])
+	hdr := map[string]string{"Idempotency-Key": "spell-" + show}
+
+	first := call(t, srv, "POST", "/shows/"+strings.ToUpper(show)+"/reserve", tok, `{"seats":["A1"]}`, hdr)
+	if first.code != 201 || first.body["show_id"] != show {
+		t.Fatalf("upper-case id: %d %v (want 201 with canonical show_id)", first.code, first.body)
+	}
+	// The same key through the canonical spelling is the same request: a replay, not 409.
+	again := call(t, srv, "POST", "/shows/"+show+"/reserve", tok, `{"seats":["A1"]}`, hdr)
+	if again.code != 201 || again.hdr.Get("Idempotent-Replayed") != "true" {
+		t.Fatalf("replay across spellings: %d %v", again.code, again.body)
+	}
+	if r := call(t, srv, "GET", "/shows/"+strings.ToUpper(show), "", "", nil); r.code != 200 {
+		t.Fatalf("GET upper-case id: %d", r.code)
+	}
+	// Spellings uuid.Parse accepts but Postgres rejects must be a clean 404, never a 5xx.
+	for _, bad := range []string{"urn:uuid:" + show, "x" + show + "x", "{" + show + "}", strings.ReplaceAll(show, "-", "")} {
+		if r := call(t, srv, "POST", "/shows/"+bad+"/reserve", tok, `{"seats":["A2"]}`, nil); r.code != 404 {
+			t.Errorf("reserve %q: %d %v", bad, r.code, r.body)
+		}
+		if r := call(t, srv, "GET", "/shows/"+bad, "", "", nil); r.code != 404 {
+			t.Errorf("get %q: %d", bad, r.code)
+		}
+	}
+}
+
+func TestPerUserLimitHoldsAcrossIDSpellingsOverHTTP(t *testing.T) {
+	srv, _ := testServer(t)
+	seats := make([]string, 12)
+	for i := range seats {
+		seats[i] = `"S` + strconv.Itoa(i+1) + `"`
+	}
+	show := createShow(t, srv, `{"name":"limit-spell","seats":[`+strings.Join(seats, ",")+`],"price_paise":100,"per_user_limit":4}`)
+	tok := token(t, srv, "greedy-"+show[:8])
+	spellings := []string{show, strings.ToUpper(show), strings.ToUpper(show[:8]) + show[8:]}
+	var wg sync.WaitGroup
+	var won atomic.Int32
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			r := call(t, srv, "POST", "/shows/"+spellings[i%3]+"/reserve", tok, `{"seats":["S`+strconv.Itoa(i+1)+`"]}`, nil)
+			if r.code == 201 {
+				won.Add(1)
+			} else if r.code != 409 || errCode(r) != "per_user_limit" {
+				t.Errorf("unexpected %d %v", r.code, r.body)
+			}
+		}(i)
+	}
+	wg.Wait()
+	if won.Load() != 4 {
+		t.Fatalf("user won %d seats on a limit-4 show", won.Load())
 	}
 }

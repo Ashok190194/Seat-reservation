@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -370,5 +371,41 @@ func TestSweeperAndReserveDoNotDeadlock(t *testing.T) {
 		}(g)
 	}
 	wg.Wait()
+	assertInvariant(t, s, show.ID)
+}
+
+func TestPerUserLimitAcrossShowIDSpellings(t *testing.T) {
+	s, _ := testStore(t)
+	show := mustShow(t, s, 20, 4, 0)
+	// Upper- and lower-case spellings of one show must share one per-user lock;
+	// otherwise parallel requests race the limit check.
+	spellings := []string{show.ID, strings.ToUpper(show.ID)}
+	user := uniq("greedy")
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	won := 0
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			out, err := s.Reserve(context.Background(), ReserveInput{ShowID: spellings[i%2], UserID: user, Seats: []string{fmt.Sprintf("S%03d", i+1)}})
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if out.Reservation != nil {
+				won++
+				if out.Reservation.ShowID != show.ID {
+					t.Errorf("reservation show_id %q, want canonical %q", out.Reservation.ShowID, show.ID)
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+	if won != 4 {
+		t.Fatalf("won=%d, want exactly the limit of 4", won)
+	}
 	assertInvariant(t, s, show.ID)
 }

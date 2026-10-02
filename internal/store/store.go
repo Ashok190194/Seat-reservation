@@ -163,11 +163,15 @@ type ReserveInput struct {
 //  2. transaction-scoped advisory lock on (show, user) — serialises a single user's parallel requests
 //  3. seat rows, SELECT ... ORDER BY label FOR UPDATE — deterministic order, so multi-seat requests cannot deadlock
 func (s *Store) Reserve(ctx context.Context, in ReserveInput) (*ReserveOutcome, error) {
-	if _, err := uuid.Parse(in.ShowID); err != nil {
+	u, err := uuid.Parse(in.ShowID)
+	if err != nil {
 		return &ReserveOutcome{Decline: showNotFound()}, nil
 	}
+	// The advisory lock key is built from this string, so every spelling of
+	// one show must reduce to the same text.
+	in.ShowID = u.String()
 	var out *ReserveOutcome
-	err := s.withRetry(ctx, func() error {
+	err = s.withRetry(ctx, func() error {
 		var err error
 		out, err = s.reserveOnce(ctx, in)
 		return err
@@ -249,8 +253,10 @@ func (s *Store) reserveOnce(ctx context.Context, in ReserveInput) (*ReserveOutco
 	}
 
 	// Serialise this user's concurrent requests for this show so the limit
-	// check below cannot be raced by the same user on disjoint seats.
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1 || ':' || $2, 0))`, in.ShowID, in.UserID); err != nil {
+	// check below cannot be raced by the same user on disjoint seats. The
+	// ::uuid::text cast keeps the key canonical even if a caller passes
+	// another spelling of the id.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1::uuid::text || ':' || $2, 0))`, in.ShowID, in.UserID); err != nil {
 		return nil, err
 	}
 
